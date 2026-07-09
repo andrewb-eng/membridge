@@ -221,7 +221,7 @@ Usage: membridge <command>
   help                this text
 
 Config: ${util.configPath()}
-Docs:   https://github.com/membridge/membridge#readme`);
+Docs:   https://github.com/mmelika/membridge#readme`);
 }
 
 const commands = {

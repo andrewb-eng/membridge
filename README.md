@@ -1,5 +1,7 @@
 # MemBridge
 
+[![CI](https://github.com/mmelika/membridge/actions/workflows/ci.yml/badge.svg)](https://github.com/mmelika/membridge/actions/workflows/ci.yml)
+
 **Shared memory across your AI coding tools.**
 
 You ask Claude Code to build a feature. An hour later you open Codex in the same
