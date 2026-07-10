@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.1 — 2026-07-10
+
+- Fix: macOS build was reported as "damaged" and refused to launch on
+  Apple Silicon. Root cause: the app had zero code signature, and arm64
+  Gatekeeper reports fully unsigned apps as damaged instead of the usual
+  unidentified-developer warning. The build now ad-hoc signs the app
+  bundle after packaging (`scripts/afterPack.js`). Still unsigned by a
+  real Apple Developer certificate, so first launch needs right-click > Open.
+
 ## 0.2.0 — 2026-07-10
 
 - **Tray app**: MemBridge now runs as a macOS menu-bar app (dock-hidden) and
