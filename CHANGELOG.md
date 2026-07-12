@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.3.0 — 2026-07-12
+
+- **Project pages**: the Overview is now a clean projects grid (name, tool
+  badges, last activity, paused state) and clicking a card opens a full
+  project page — Activity (the complete ask-by-ask history with the files
+  each ask touched) and Memory (what gets injected where, a read-only view
+  of the full memory log, pause/resume/delete). ✕, Esc and browser-back all
+  exit. (New endpoints: `GET /api/project`, `GET /api/project/memory`.)
+- **Neural map**: a second dashboard tab with a force-directed 3D map of
+  every chat across every project, linked by shared files and TF-IDF idea
+  similarity. Events now carry per-chat session ids (state v2 triggers a
+  one-time full rescan from the transcripts). (New: `lib/graph.js`,
+  `GET /api/graph`.)
+- **Settings**: a gear in the header opens Settings — set the sync interval
+  and context files, which used to require editing config by hand. Interval
+  changes now apply without restarting the daemon. (New:
+  `GET/POST /api/settings`.)
+- **Copy for AI**: every project page has a Copy for AI button that puts a
+  trimmed, redacted digest of recent AI activity on the clipboard, ready to
+  paste into ChatGPT / claude.ai / any web AI that can't see your disk. The
+  manual bridge until importers/MCP land. (New endpoint:
+  `POST /api/projects/copy`.)
+- Fix: a fast `stop` → `start` could leave the new daemon running with a dead
+  dashboard when the port was still held by the dying process. The dashboard
+  now retries the bind (EADDRINUSE) for up to ~10s before giving up, and says
+  so in the log if it does.
+
 ## 0.2.1 — 2026-07-10
 
 - Fix: macOS build was reported as "damaged" and refused to launch on

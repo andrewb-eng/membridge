@@ -65,6 +65,24 @@ than the brief summary can follow the reference. Add `.membridge/` to your
 project's `.gitignore` if you don't want the memory committed — or commit it
 to share AI context with your whole team.
 
+## The dashboard
+
+`membridge dashboard` opens a local web UI (the menu-bar app shows the same
+thing):
+
+- **Projects grid** — every project with AI activity: tool badges, last
+  activity, paused state. Click one for its page.
+- **Project pages** — the full ask-by-ask activity feed with the files each
+  ask touched; a Memory tab showing exactly what gets injected where, with a
+  read-only view of the full memory log; pause/resume and delete; and a
+  **Copy for AI** button that puts a trimmed, redacted digest on your
+  clipboard for pasting into ChatGPT, claude.ai, or any web AI that cannot
+  see your disk.
+- **Neural map** — a force-directed map of every chat across every project,
+  linked by shared files and shared ideas.
+- **Settings** — sync interval and target files, editable live. No
+  config-file editing required.
+
 ## Quick start
 
 **macOS menu-bar app:** download `MemBridge-<version>.dmg` from the
@@ -199,9 +217,27 @@ The core stays zero-dependency; Electron is a devDependency used only by the
 tray app. CI runs the suite on Linux, Windows, and macOS across Node 18/20/22,
 and the "Build app" workflow produces macOS builds on Apple runners.
 
+The suite is fully offline and hermetic: it runs in temp dirs only. To hack
+on the dashboard against fake data without touching your real
+`~/.membridge`, run the daemon with the `MEMBRIDGE_HOME`,
+`MEMBRIDGE_CLAUDE_DIR`, `MEMBRIDGE_CODEX_DIR` and `MEMBRIDGE_PORT` env
+overrides pointed at a scratch folder.
+
+Code map: [`lib/scan.js`](lib/scan.js) (adapters → events → sync),
+[`lib/digest.js`](lib/digest.js) (memory block + injection),
+[`lib/memorydb.js`](lib/memorydb.js) (per-project `.membridge/` DB),
+[`lib/graph.js`](lib/graph.js) (neural-map data),
+[`lib/server.js`](lib/server.js) (local HTTP API),
+[`lib/dashboard.js`](lib/dashboard.js) (the whole web UI, one file, no build
+step), [`bin/membridge.js`](bin/membridge.js) (CLI). Recent changes are in
+[CHANGELOG.md](CHANGELOG.md).
+
 ## Roadmap
 
 - LLM-powered summaries (optional API key): richer memory in fewer lines
+- Neural map v2: calmer 2D layout by default, 3D behind a toggle
+- Import ChatGPT / claude.ai data exports, and a `membridge mcp` server so
+  MCP-capable clients can query project memory live
 - First-class adapters for Gemini CLI, Cursor, opencode, Copilot CLI
 - Team sync: share project memory across machines
 - Signed + notarized macOS builds

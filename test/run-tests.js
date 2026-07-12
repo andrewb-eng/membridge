@@ -3,6 +3,7 @@
 // dir via MEMBRIDGE_* env overrides — no real user files are read or written.
 const assert = require('assert');
 const fs = require('fs');
+const net = require('net');
 const os = require('os');
 const path = require('path');
 const { spawn, spawnSync } = require('child_process');
@@ -16,6 +17,8 @@ process.env.MEMBRIDGE_INTERVAL = '3600'; // daemon ticks once at boot, then stay
 const util = require('../lib/util');
 const { syncOnce } = require('../lib/scan');
 const digest = require('../lib/digest');
+const { buildGraph } = require('../lib/graph');
+const { startServer } = require('../lib/server');
 
 const BIN = path.join(__dirname, '..', 'bin', 'membridge.js');
 const proj1 = path.join(ROOT, 'projects', 'shop-app');
@@ -225,7 +228,88 @@ async function main() {
     assert.ok(!fs.existsSync(path.join(proj1, '.membridge')), 'memory DB not removed');
   });
 
-  // --- 4. daemon + dashboard ---
+  // --- 4. session ids, state migration, neural graph ---
+  check('events carry per-chat session ids from the transcript filename', () => {
+    const state = util.loadState();
+    const key = Object.keys(state.projects).find(k => k.toLowerCase() === proj1.toLowerCase());
+    assert.ok(key, 'proj1 missing from state');
+    const events = state.projects[key].events;
+    assert.ok(events.length && events.every(e => e.session), 'event without session id');
+    const claudeEv = events.find(e => e.text === 'Build the login page with OAuth');
+    const codexEv = events.find(e => e.text === 'Add unit tests for the login form');
+    assert.ok(claudeEv && codexEv, 'expected events missing from state');
+    assert.strictEqual(claudeEv.session, 'sess1');
+    assert.strictEqual(codexEv.session, 'rollout-1');
+    assert.notStrictEqual(claudeEv.session, codexEv.session, 'sessions not distinct per transcript');
+  });
+
+  // Simulate a pre-v2 state file: stripping `version` must trigger a full
+  // rescan of every transcript from byte 0 on the next sync.
+  const v1State = JSON.parse(read(util.statePath()));
+  delete v1State.version;
+  fs.writeFileSync(util.statePath(), JSON.stringify(v1State, null, 2));
+  const rBackfill = syncOnce();
+  check('versionless state is discarded and all transcripts are re-read', () => {
+    const want = r1.newEvents + r2.newEvents;
+    assert.ok(rBackfill.newEvents >= want, `expected >=${want} backfill events, got ${rBackfill.newEvents}`);
+    assert.strictEqual(JSON.parse(read(util.statePath())).version, util.STATE_VERSION, 'state not re-stamped');
+  });
+  check('backfill re-injects exactly one block, no duplicated prompts', () => {
+    const md = claudeMd();
+    assert.strictEqual(count(md, digest.BEGIN), 1, 'duplicate block');
+    assert.strictEqual(count(md, 'Build the login page with OAuth'), 1, 'duplicate prompt');
+  });
+
+  // A second Claude Code session in the same project: same idea (OAuth login),
+  // same file — the graph must connect it to sess1.
+  fs.writeFileSync(path.join(process.env.MEMBRIDGE_CLAUDE_DIR, 'slug-shop-app', 'sess3.jsonl'), jsonl([
+    { type: 'user', message: { role: 'user', content: 'Improve the OAuth login redirect error handling' }, cwd: proj1, timestamp: '2026-07-09T10:20:00.000Z' },
+    { type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', name: 'Edit', input: { file_path: path.join(proj1, 'src', 'login.js') } }] }, cwd: proj1, timestamp: '2026-07-09T10:21:00.000Z' },
+  ]));
+  syncOnce();
+
+  const graph = buildGraph(util.loadState(), util.getConfig());
+  check('graph: project node exists with >=3 distinct chat nodes', () => {
+    const pNode = graph.nodes.find(n => n.type === 'project' && String(n.path).toLowerCase() === proj1.toLowerCase());
+    assert.ok(pNode, 'proj1 project node missing');
+    assert.ok(pNode.chats >= 3, `expected >=3 chats on project node, got ${pNode.chats}`);
+    const chats = graph.nodes.filter(n => n.type === 'chat' && String(n.project).toLowerCase() === proj1.toLowerCase());
+    assert.ok(chats.length >= 3, `expected >=3 chat nodes, got ${chats.length}`);
+    assert.strictEqual(new Set(chats.map(c => c.id)).size, chats.length, 'chat ids not distinct');
+  });
+  check('graph: every chat node has a member link to its project', () => {
+    const chats = graph.nodes.filter(n => n.type === 'chat');
+    assert.ok(chats.length, 'no chat nodes at all');
+    for (const c of chats) {
+      assert.ok(
+        graph.links.some(l => l.type === 'member' && l.source === c.id && l.target === 'p:' + c.project),
+        `no member link for ${c.id}`,
+      );
+    }
+  });
+  check('graph: sess1 and sess3 are related by shared file and oauth terms', () => {
+    const rel = graph.links.find(l => l.type === 'related' &&
+      ((l.source === 'c:sess1' && l.target === 'c:sess3') || (l.source === 'c:sess3' && l.target === 'c:sess1')));
+    assert.ok(rel, 'related link between sess1 and sess3 missing');
+    assert.ok(rel.sharedFiles.some(f => f.includes('login.js')), `sharedFiles lack login.js: ${JSON.stringify(rel.sharedFiles)}`);
+    assert.ok(rel.similarity > 0, `similarity not positive: ${rel.similarity}`);
+    assert.ok(rel.terms.some(t => /^(oauth|login|redirect)/.test(t)), `no oauth-family term: ${JSON.stringify(rel.terms)}`);
+  });
+  check('graph: redacted secret never appears in graph output', () => {
+    assert.ok(!JSON.stringify(graph).includes('sk-test1234567890abcdef'), 'secret leaked into graph');
+  });
+
+  // Strip everything again so the daemon section starts from the same clean
+  // slate it always did (no blocks, no AGENTS.md, no memory DB).
+  check('remove still cleans up after the backfill', () => {
+    const out = spawnSync(process.execPath, [BIN, 'remove', '--project', proj1], { encoding: 'utf8' });
+    assert.strictEqual(out.status, 0, out.stderr);
+    assert.ok(!claudeMd().includes(digest.BEGIN), 'block not stripped');
+    assert.ok(!fs.existsSync(path.join(proj1, 'AGENTS.md')), 'AGENTS.md not deleted');
+    assert.ok(!fs.existsSync(path.join(proj1, '.membridge')), 'memory DB not removed');
+  });
+
+  // --- 5. daemon + dashboard ---
   const PORT = 17941;
   const child = spawn(process.execPath, [BIN, 'daemon'], {
     env: { ...process.env, MEMBRIDGE_PORT: String(PORT) },
@@ -241,8 +325,35 @@ async function main() {
       assert.ok(status.adapters.includes('Claude Code') && status.adapters.includes('MyTool'), 'adapters missing');
     });
     const page = await fetch(base);
+    const pageHtml = await page.text();
     check('dashboard page serves 200 html', () => {
       assert.strictEqual(page.status, 200);
+    });
+    check('dashboard page has Overview and Neural map tabs', () => {
+      assert.ok(pageHtml.includes('Overview'), 'Overview tab missing');
+      assert.ok(pageHtml.includes('Neural map'), 'Neural map tab missing');
+    });
+    check('dashboard page has the Copy for AI button', () => {
+      assert.ok(pageHtml.includes('Copy for AI'), 'Copy for AI button missing');
+    });
+    check('dashboard page has the project view', () => {
+      assert.ok(pageHtml.includes('view-project'), 'project view missing');
+    });
+    check('dashboard page has the Settings screen without BYOK/plan remnants', () => {
+      assert.ok(pageHtml.includes('view-settings'), 'settings view missing');
+      assert.ok(pageHtml.includes('Syncing'), 'sync section missing');
+      assert.ok(!pageHtml.includes('Anthropic API key'), 'BYOK key section still on the page');
+      assert.ok(!pageHtml.includes('Planner model'), 'planner model section still on the page');
+      assert.ok(!pageHtml.includes('data-ptab="plan"'), 'Plan tab still on the page');
+    });
+    const graphRes = await fetch(`${base}/api/graph`);
+    const graphText = await graphRes.text();
+    check('dashboard /api/graph serves nodes and links, secrets redacted', () => {
+      assert.strictEqual(graphRes.status, 200);
+      const g = JSON.parse(graphText);
+      assert.ok(Array.isArray(g.nodes) && g.nodes.some(n => n.type === 'chat'), 'chat nodes missing');
+      assert.ok(Array.isArray(g.links) && g.links.some(l => l.type === 'member'), 'member links missing');
+      assert.ok(!graphText.includes('sk-test1234567890abcdef'), 'secret leaked over HTTP');
     });
     const projects = await (await fetch(`${base}/api/projects`)).json();
     check('dashboard /api/projects lists the project with prompts', () => {
@@ -276,12 +387,122 @@ async function main() {
       assert.ok(claudeMd().includes('Implement the secret feature Zeta'), 'event lost');
       assert.ok(fs.existsSync(path.join(proj1, 'AGENTS.md')), 'AGENTS.md not recreated');
     });
+
+    // Copy for AI: the digest served to the dashboard's clipboard button
+    const copyRes = await post(`${base}/api/projects/copy`, { path: proj1 });
+    const copyBody = await copyRes.json();
+    const copyBad = await post(`${base}/api/projects/copy`, { path: path.join(ROOT, 'no-such-dir') });
+    check('copy-for-AI digest has the project, prompts and files', () => {
+      assert.strictEqual(copyRes.status, 200);
+      assert.ok(copyBody.text.includes('shop-app'), 'project name missing');
+      assert.ok(copyBody.text.includes('Build the login page with OAuth'), 'Claude prompt missing');
+      assert.ok(copyBody.text.includes('Add unit tests for the login form'), 'Codex prompt missing');
+      assert.ok(copyBody.text.includes('src/login.js'), 'touched file missing');
+      assert.ok(copyBody.text.includes('Project top level:'), 'top-level listing missing');
+      assert.ok(!copyBody.text.includes('node_modules'), 'ignored dir leaked into top level');
+    });
+    check('copy-for-AI digest is redacted, unknown project 404s', () => {
+      assert.ok(!copyBody.text.includes('sk-test1234567890abcdef'), 'secret leaked into copy digest');
+      assert.ok(copyBody.text.includes('[redacted]'), 'no redaction marker in copy digest');
+      assert.strictEqual(copyBad.status, 404, 'unknown project was accepted');
+    });
+
+    // M1: grid payload + project page endpoints
+    const projList = await (await fetch(`${base}/api/projects`)).json();
+    check('/api/projects reports which tools were used per project', () => {
+      const p = projList.find(x => x.path.toLowerCase() === proj1.toLowerCase());
+      assert.ok(p && Array.isArray(p.tools), 'tools missing');
+      assert.ok(p.tools.includes('Claude Code') && p.tools.includes('Codex'), `tools said: ${JSON.stringify(p && p.tools)}`);
+    });
+    const detRes = await fetch(`${base}/api/project?path=${encodeURIComponent(proj1)}`);
+    const det = await detRes.json();
+    const detBad = await fetch(`${base}/api/project?path=${encodeURIComponent(path.join(ROOT, 'no-such-dir'))}`);
+    check('/api/project returns the full project-page detail', () => {
+      assert.strictEqual(detRes.status, 200);
+      assert.strictEqual(det.name, 'shop-app');
+      assert.ok(det.entries.length >= 4, `expected >=4 entries, got ${det.entries.length}`);
+      assert.ok(det.entries.some(e => e.files.includes('src/login.js')), 'no entry carries the edited file');
+      assert.ok(!JSON.stringify(det).includes('sk-test1234567890abcdef'), 'secret leaked into detail');
+      assert.ok(det.targets.some(t => t.file === 'CLAUDE.md' && t.exists), 'targets missing');
+      assert.ok(det.tools.includes('Codex'), 'tools missing from detail');
+      assert.strictEqual(det.memory.exists, true, 'memory.md not reported as existing');
+      assert.strictEqual(detBad.status, 404, 'unknown project was accepted');
+    });
+    const memRes = await fetch(`${base}/api/project/memory?path=${encodeURIComponent(proj1)}`);
+    const memText = await memRes.text();
+    const memBad = await fetch(`${base}/api/project/memory?path=${encodeURIComponent(path.join(ROOT, 'no-such-dir'))}`);
+    check('/api/project/memory serves the memory log read-only', () => {
+      assert.strictEqual(memRes.status, 200);
+      assert.ok(memText.includes('Project memory'), 'memory.md content missing');
+      assert.ok(!memText.includes('sk-test1234567890abcdef'), 'secret in served memory.md');
+      assert.strictEqual(memBad.status, 404, 'unknown project memory was served');
+    });
+
+    // M2: settings (sync interval + injection targets)
+    const st0 = await (await fetch(`${base}/api/settings`)).json();
+    const stSave = await (await post(`${base}/api/settings`, {
+      intervalSec: 45, targets: ['CLAUDE.md', 'AGENTS.md'],
+    })).json();
+    check('settings: interval and targets save and persist', () => {
+      assert.ok(Array.isArray(st0.targets) && st0.targets.includes('CLAUDE.md'), 'targets missing from payload');
+      assert.deepStrictEqual(stSave.targets, ['CLAUDE.md', 'AGENTS.md']);
+      const rawCfg = JSON.parse(read(util.configPath()));
+      assert.strictEqual(rawCfg.intervalSec, 45, 'interval not persisted');
+      assert.deepStrictEqual(rawCfg.targets, ['CLAUDE.md', 'AGENTS.md'], 'targets not persisted');
+    });
+    const lowSave = await post(`${base}/api/settings`, { intervalSec: 3 });
+    check('settings: interval below the 15s floor is clamped', () => {
+      assert.strictEqual(lowSave.status, 200);
+      const rawCfg = JSON.parse(read(util.configPath()));
+      assert.strictEqual(rawCfg.intervalSec, 15, `interval persisted as ${rawCfg.intervalSec}`);
+    });
+
+    // add a fresh, never-seen directory via the dashboard API
+    const freshDir = path.join(ROOT, 'projects', 'fresh-app');
+    fs.mkdirSync(freshDir, { recursive: true });
+    const addFirst = await (await post(`${base}/api/projects/add`, { path: freshDir })).json();
+    const afterAdd = await (await fetch(`${base}/api/projects`)).json();
+    const addAgain = await (await post(`${base}/api/projects/add`, { path: freshDir })).json();
+    const addBad = await post(`${base}/api/projects/add`, { path: path.join(ROOT, 'no-such-dir') });
+    check('add project registers an empty project', () => {
+      assert.strictEqual(addFirst.added, true, `first add said: ${JSON.stringify(addFirst)}`);
+      const p = afterAdd.find(x => x.path.toLowerCase() === freshDir.toLowerCase());
+      assert.ok(p, 'added project missing from /api/projects');
+      assert.strictEqual(p.prompts.length, 0, 'empty project reported prompts');
+      assert.strictEqual(addAgain.added, false, 'second add not reported as already tracked');
+      assert.strictEqual(addBad.status, 400, 'nonexistent path was accepted');
+    });
+
+    const delRes = await (await post(`${base}/api/projects/delete`, { path: proj1 })).json();
+    const afterDel = await (await fetch(`${base}/api/projects`)).json();
+    check('delete project strips blocks, memory and state', () => {
+      assert.strictEqual(delRes.deleted, true, `delete said: ${JSON.stringify(delRes)}`);
+      const md = claudeMd();
+      assert.ok(!md.includes(digest.BEGIN), 'block not stripped from CLAUDE.md');
+      assert.ok(md.startsWith('# Shop app'), 'original heading lost');
+      assert.ok(!fs.existsSync(path.join(proj1, '.membridge')), '.membridge dir not removed');
+      assert.ok(!afterDel.some(x => x.path.toLowerCase() === proj1.toLowerCase()), 'project still listed');
+    });
+
+    // new activity in a deleted project must bring it back (offsets were
+    // already consumed, so only the appended event returns)
+    fs.appendFileSync(
+      path.join(process.env.MEMBRIDGE_CLAUDE_DIR, 'slug-shop-app', 'sess1.jsonl'),
+      JSON.stringify({ type: 'user', message: { role: 'user', content: 'Ship the checkout flow' }, cwd: proj1, timestamp: '2026-07-09T12:00:00.000Z' }) + '\n',
+    );
+    await post(`${base}/api/sync`);
+    const afterRevive = await (await fetch(`${base}/api/projects`)).json();
+    check('deleted project reappears with new activity', () => {
+      const p = afterRevive.find(x => x.path.toLowerCase() === proj1.toLowerCase());
+      assert.ok(p, 'deleted project did not reappear');
+      assert.ok(p.prompts.some(e => e.text.includes('Ship the checkout flow')), 'new prompt missing');
+    });
   } finally {
     child.kill();
   }
   await new Promise(r => setTimeout(r, 300));
 
-  // --- 5. CLI start/stop lifecycle ---
+  // --- 6. CLI start/stop lifecycle ---
   const env2 = { ...process.env, MEMBRIDGE_PORT: '17942' };
   const startOut = spawnSync(process.execPath, [BIN, 'start'], { env: env2, encoding: 'utf8' });
   await new Promise(r => setTimeout(r, 1500));
@@ -294,6 +515,27 @@ async function main() {
     assert.ok(/Stopped MemBridge/.test(stopOut.stdout), `stop said: ${stopOut.stdout}`);
     assert.ok(/not running/.test(statusOut2.stdout), `status said: ${statusOut2.stdout}`);
   });
+
+  // --- 7. dashboard port retry (EADDRINUSE) ---
+  // A fast stop→start can find the port still held by the dying daemon: the
+  // server must retry the bind instead of leaving a daemon with no dashboard.
+  {
+    const PORT3 = 17943;
+    const blocker = net.createServer();
+    await new Promise(r => blocker.listen(PORT3, '127.0.0.1', r));
+    const srv = startServer(PORT3, { retries: 40, retryDelayMs: 100 });
+    await new Promise(r => setTimeout(r, 350)); // let a few binds fail first
+    const logAfterRetries = read(util.logPath());
+    await new Promise(r => blocker.close(r));
+    const retryRes = await waitForHttp(`http://127.0.0.1:${PORT3}/api/status`);
+    check('dashboard retries EADDRINUSE and binds once the port frees', () => {
+      assert.ok(logAfterRetries.includes(`port ${PORT3} in use, retrying`), 'no retry log line');
+      assert.ok(!logAfterRetries.includes(`dashboard on http://127.0.0.1:${PORT3}`), 'bound while port was blocked');
+      assert.ok(retryRes.ok, 'dashboard never came up after the port freed');
+      assert.ok(read(util.logPath()).includes(`dashboard on http://127.0.0.1:${PORT3}`), 'no bind log line');
+    });
+    await new Promise(r => srv.close(r));
+  }
 
   // --- summary ---
   const failed = results.filter(([, e]) => e);
