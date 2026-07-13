@@ -1289,6 +1289,29 @@ async function main() {
     session_id: session, cwd: projR, hook_event_name: 'Stop',
     transcript_path: path.join(rDir, `${session}.jsonl`), stop_hook_active: false, ...extra,
   });
+  // Raw stdin + arbitrary env, for the fail-open paths the JSON helper can't reach.
+  const runHookRaw = (input, env) => spawnSync(process.execPath, [BIN, 'hook', 'stop'], {
+    input, encoding: 'utf8', env: { ...process.env, ...env },
+  });
+
+  // Fail-open on the most common real path: the hook is installed but the
+  // daemon never ran, so MEMBRIDGE_HOME has no state.json at all. And on
+  // garbage/empty stdin (not a real hook invocation). Both must exit 0 silent.
+  check('distill: hook fails open on a fresh HOME with no state and on garbage stdin', () => {
+    const freshHome = path.join(ROOT, 'distill-fresh-home');
+    const env = { MEMBRIDGE_HOME: freshHome };
+    assert.ok(!fs.existsSync(path.join(freshHome, 'state.json')), 'fresh home should have no state');
+    for (const [label, out] of [
+      ['fresh home, valid payload', runHookRaw(JSON.stringify(stopPayload('sessR')), env)],
+      ['garbage stdin', runHookRaw('not json at all', env)],
+      ['empty stdin', runHookRaw('', env)],
+      ['valid JSON, wrong type', runHookRaw('42', env)],
+    ]) {
+      assert.strictEqual(out.status, 0, `${label}: exit ${out.status} (${out.stderr})`);
+      assert.strictEqual(out.stdout, '', `${label}: wrote to stdout: ${out.stdout}`);
+      assert.strictEqual(out.stderr, '', `${label}: wrote to stderr: ${out.stderr}`);
+    }
+  });
 
   check('distill: pickSummary prefers Distilled over a newer harvested summary', () => {
     const distilledOlder = { ts: '2026-07-12T09:00:00.000Z', source: 'Distilled', kind: 'summary', session: 's', text: 'D' };
@@ -1435,6 +1458,22 @@ async function main() {
     assert.deepStrictEqual(afterRemove.hooks.PreToolUse, seedSettings.hooks.PreToolUse, 'unrelated hooks changed');
     assert.strictEqual(afterRemove.model, 'opus');
   });
+  // A settings.json MemBridge cannot safely parse must be refused, never
+  // overwritten — a silent default-to-{} regression would wipe the user's
+  // whole file (all their hooks, model, permissions).
+  check('distill: setup/remove-hooks refuse an unsafe settings.json, leaving it byte-identical', () => {
+    for (const bad of ['{ not json', JSON.stringify([1, 2, 3]), JSON.stringify({ hooks: [] }), JSON.stringify({ hooks: { Stop: {} } })]) {
+      const badFile = path.join(ROOT, 'bad-settings.json');
+      fs.writeFileSync(badFile, bad);
+      const env = { ...process.env, MEMBRIDGE_CLAUDE_SETTINGS: badFile };
+      for (const cmd of ['setup-hooks', 'remove-hooks']) {
+        const out = spawnSync(process.execPath, [BIN, cmd], { env, encoding: 'utf8' });
+        assert.strictEqual(out.status, 1, `${cmd} on ${bad}: expected exit 1, got ${out.status}`);
+        assert.ok(/refusing to touch/i.test(out.stderr), `${cmd} on ${bad}: no refusal message (${out.stderr})`);
+        assert.strictEqual(read(badFile), bad, `${cmd} on ${bad}: file was modified`);
+      }
+    }
+  });
 
   // Team push: the pushed summary field is the Distilled text, redacted.
   const mock3 = createMockSupabase();
@@ -1459,6 +1498,24 @@ async function main() {
     delete process.env.MEMBRIDGE_TEAM_ANON_KEY;
     await new Promise(r => mock3.server.close(r));
   }
+
+  // Incremental second read: a summary appended AFTER the first scan must be
+  // merged on the next sync. Pins the offset to the byte past the last
+  // newline, so an over-advance that silently drops every later summary
+  // (mergeEvents dedup would otherwise mask a sibling re-read) can't ship
+  // green. Runs last: this supersedes sessR's earlier distilled summary.
+  check('distill: a summary appended after the first scan is merged incrementally', () => {
+    const before = util.loadState().files[summariesFile].offset;
+    fs.appendFileSync(summariesFile,
+      JSON.stringify({ session: 'sessR', ts: '2026-07-12T09:59:00.000Z', did: 'Follow-up: added a metrics counter for retry exhaustion so ops can alert on it.', decisions: '', gotchas: '' }) + '\n');
+    const r = syncOnce();
+    assert.ok(r.newEvents >= 1, `appended line produced no new event (got ${r.newEvents})`);
+    const merged = richEvents().filter(e => e.kind === 'summary' && e.source === 'Distilled' && e.session === 'sessR');
+    assert.ok(merged.some(e => e.text.includes('metrics counter for retry exhaustion')), 'appended summary not merged into events');
+    const after = util.loadState().files[summariesFile].offset;
+    assert.ok(after > before, `offset did not advance: ${before} -> ${after}`);
+    assert.ok(richMd().includes('metrics counter for retry exhaustion'), 'appended summary not rendered (latest-in-tier wins)');
+  });
 
   // --- summary ---
   const failed = results.filter(([, e]) => e);
