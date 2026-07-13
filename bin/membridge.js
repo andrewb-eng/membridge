@@ -485,6 +485,12 @@ Usage: membridge <command>
   daemon              run in the foreground (used internally / by services)
   help                this text
 
+Distillation (agent-written session summaries — see README):
+  setup-hooks         add a Claude Code Stop hook: the agent that did the work
+                      writes a 2-3 line summary before each session ends
+  remove-hooks        remove the MemBridge Stop hook (your other hooks are kept)
+  hook stop           the hook itself (invoked by Claude Code, not by you)
+
 Team sync (share project memory with your team — see README):
   join <link-or-code> [--email <e> --password <p>]   one command from invite to member
   signup / login --email <e> --password <p> [--name "You"]
@@ -517,6 +523,8 @@ const commands = {
   join: cmdJoin,
   team: cmdTeam,
   hook: cmdHook,
+  'setup-hooks': () => console.log(hooks.setupHooks()),
+  'remove-hooks': () => console.log(hooks.removeHooks()),
   'enable-autostart': () => console.log(autostart.enable()),
   'disable-autostart': () => console.log(autostart.disable()),
   help: cmdHelp,
@@ -532,7 +540,9 @@ if (!fn) {
   cmdHelp();
   process.exit(1);
 }
-Promise.resolve(fn()).catch(err => {
+// .then(fn), not .resolve(fn()): a synchronous throw must reach the same
+// clean error path as an async rejection.
+Promise.resolve().then(fn).catch(err => {
   console.error(err && err.message ? err.message : err);
   process.exit(1);
 });
