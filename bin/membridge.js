@@ -294,6 +294,38 @@ function cmdLogout() {
   console.log(teamsync.clearCredentials() ? 'Logged out.' : 'Already logged out.');
 }
 
+// One command from invite to member: `membridge join <link-or-token-or-code>`.
+// Logged out + --email given -> logs in, or signs up if the account is new.
+async function cmdJoin() {
+  util.ensureConfig();
+  const config = util.getConfig();
+  const input = args[1];
+  if (!input || input.startsWith('--')) {
+    die('Usage: membridge join <invite link or code> [--email you@company.com --password <pass> [--name "Your Name"]]');
+  }
+  if (!teamsync.isConfigured(config)) {
+    die('Team sync is not available in this build (see the Team sync section of the README).');
+  }
+  if (!teamsync.loadCredentials()) {
+    const email = opt('--email');
+    const password = opt('--password') || process.env.MEMBRIDGE_PASSWORD || null;
+    if (!email || !password) {
+      die('You are not logged in. Add --email and --password and MemBridge will log you in — or create the account if it is new.');
+    }
+    try {
+      await teamsync.login(config, email, password, opt('--name'));
+    } catch {
+      const r = await teamsync.signup(config, email, password, opt('--name'));
+      if (r.needsConfirmation) {
+        die(`Account created — check ${email} for a confirmation link, then run this join command again.`);
+      }
+    }
+  }
+  const t = await teamsync.join(config, input);
+  console.log(`Joined team "${t.team_name}".`);
+  console.log('Next: link a project with `membridge team link` inside it — or just work; matching git remotes are detected and suggested automatically.');
+}
+
 async function cmdTeam() {
   util.ensureConfig();
   const sub = args[1] || 'list';
@@ -328,9 +360,36 @@ async function cmdTeam() {
 
   if (sub === 'join') {
     const code = args[2];
-    if (!code) die('Usage: membridge team join <invite-code>');
-    const t = await teamsync.joinTeam(config, code);
+    if (!code) die('Usage: membridge team join <invite link or code>');
+    const t = await teamsync.join(config, code);
     console.log(`Joined team "${t.team_name}" (${t.team_id}).`);
+    return;
+  }
+
+  if (sub === 'invite') {
+    let teamId = opt('--team');
+    const teams = await teamsync.listTeams(config);
+    if (!teamId && teams.length === 1) teamId = teams[0].team_id;
+    if (!teamId) {
+      die(`Pick a team with --team <id>:\n` + teams.map(t => `  ${t.team_id}  ${t.team_name}`).join('\n'));
+    }
+    const days = parseInt(opt('--expires-days') || '', 10);
+    const maxUses = parseInt(opt('--max-uses') || '', 10);
+    const inv = await teamsync.createInvite(config, teamId, {
+      expiresAt: Number.isFinite(days) ? new Date(Date.now() + days * 86400000).toISOString() : null,
+      maxUses: Number.isFinite(maxUses) ? maxUses : null,
+    });
+    console.log(`Invite link created${inv.expires_at ? `, expires ${inv.expires_at.slice(0, 10)}` : ''}${inv.max_uses ? `, max ${inv.max_uses} use(s)` : ''}.`);
+    if (inv.url) console.log(`  ${inv.url}`);
+    console.log(`  membridge join ${inv.token}`);
+    return;
+  }
+
+  if (sub === 'revoke-invite') {
+    const token = args[2];
+    if (!token) die('Usage: membridge team revoke-invite <token or link>');
+    await teamsync.revokeInvite(config, token);
+    console.log('Invite revoked. Anyone holding that link can no longer join.');
     return;
   }
 
@@ -385,7 +444,7 @@ async function cmdTeam() {
     return;
   }
 
-  die(`Unknown team subcommand: ${sub}\nUsage: membridge team <setup|create|join|link|unlink|list>`);
+  die(`Unknown team subcommand: ${sub}\nUsage: membridge team <setup|create|invite|revoke-invite|join|link|unlink|list>`);
 }
 
 function cmdHelp() {
@@ -411,10 +470,13 @@ Usage: membridge <command>
   help                this text
 
 Team sync (share project memory with your team — see README):
+  join <link-or-code> [--email <e> --password <p>]   one command from invite to member
   signup / login --email <e> --password <p> [--name "You"]
   logout
   team create <name>       new team (prints the invite code)
-  team join <invite-code>  join a teammate's team
+  team invite [--team <id>] [--expires-days N] [--max-uses N]   create an invite link
+  team revoke-invite <token>                   kill an invite link
+  team join <link-or-code> join a teammate's team (same as top-level join)
   team link [--project <path>] [--team <id>]   sync this project with the team
   team unlink [--project <path>]               stop syncing this project
   team list                your login, teams and linked projects
@@ -436,6 +498,7 @@ const commands = {
   signup: cmdSignup,
   login: cmdLogin,
   logout: cmdLogout,
+  join: cmdJoin,
   team: cmdTeam,
   'enable-autostart': () => console.log(autostart.enable()),
   'disable-autostart': () => console.log(autostart.disable()),

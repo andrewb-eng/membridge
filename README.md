@@ -102,18 +102,29 @@ Just sign up:
 ```bash
 membridge signup --email you@company.com --password ... --name "Marco"
 
-# one person creates the team...
-membridge team create acme        # prints the invite code
-# ...everyone else joins it
-membridge team join <invite-code>
+# one person creates the team and mints an invite link...
+membridge team create acme
+membridge team invite             # optional: --expires-days 7 --max-uses 5
+
+# ...everyone else joins with one command (creates the account if needed)
+membridge join <link-or-token> --email you@co.com --password ...
 
 # inside a project you want to share
 membridge team link               # commit .membridge/team.json for teammates
 ```
 
 From then on the daemon syncs the linked project with your team on its
-normal interval. `membridge team list` shows your teams and linked projects;
-`membridge team unlink` stops sharing a project.
+normal interval. When your clone of a repo a teammate already shares is
+detected (same normalized git remote), MemBridge **suggests** the link in the
+dashboard — nothing is shared until you confirm (or opt into automatic
+linking with `"team": { "autoLink": true }`). `membridge team list` shows
+your teams and linked projects; `membridge team unlink` stops sharing;
+`membridge team revoke-invite <token>` kills a link you regret sending.
+
+Prefer a browser? The [`web/`](web/README.md) folder is the hosted team
+workspace (Next.js + Supabase): invite landings at `/join/<token>`, the team
+feed, project stats, and member/role/invite management — teammates can see
+who did what without installing anything.
 
 **What leaves your machine (and only for linked projects):** the same
 redacted digest entries you see in `.membridge/memory.md` — timestamps, tool
@@ -129,7 +140,9 @@ hosted MemBridge backend (baked into [`lib/backend.json`](lib/backend.json)),
 so users configure nothing. To run your own instead:
 
 1. Create a [Supabase](https://supabase.com) project (free tier is plenty),
-   open its SQL Editor, and run [`supabase/schema.sql`](supabase/schema.sql).
+   open its SQL Editor, and run [`supabase/schema.sql`](supabase/schema.sql)
+   followed by [`supabase/migrations/002_team_v2.sql`](supabase/migrations/002_team_v2.sql)
+   (invite links, roles, the feed the web app uses).
 2. Grab the Project URL and `anon` public key from Settings → API. Both are
    safe to publish — the anon key is meant for client apps, and row-level
    security is what protects the data.

@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.6.0 — 2026-07-13
+
+- **Invite links (team schema v2)**: `membridge team invite` mints a short
+  URL-safe token — shareable as `https://<web app>/join/<token>` or
+  `membridge join <token>` — with optional expiry (`--expires-days`) and use
+  cap (`--max-uses`), revocable with `team revoke-invite`. A redeem can never
+  grant more than the member role; rotating the legacy code also revokes all
+  outstanding links. The legacy UUID invite code keeps working — `join`
+  routes on the input's shape. (`supabase/migrations/002_team_v2.sql` — a
+  migration, so the live backend upgrades without recreating anything.)
+- **`membridge join <link-or-code>`**: one command from invite to member —
+  logs in, or creates the account if it's new (`--email` / `--password`),
+  then joins. The dashboard's team page gains a "Copy invite link" button.
+- **Auto-link, prompt-first**: when a local project's normalized git remote
+  matches a project a teammate already shares, MemBridge *suggests* the link
+  (dashboard card + log line) and shares nothing until you confirm. Opt into
+  fully automatic linking with `"team": { "autoLink": true }` in config.
+- **Roles & management**: `admin` role between owner and member; RPCs for
+  remove_member, set_role, rename_team, rotate_invite, leave_team with
+  owner/admin checks; `team_feed` (keyset pagination + person/project/tool
+  filters) and a `project_stats` view power the web app in one query.
+- **Hosted web workspace (`web/`)**: Next.js + supabase-js + Tailwind, no
+  custom API server — RLS is the authorization layer. Screens: `/join/<token>`
+  invite landing (team name via `peek_invite`, inline signup, auto-join,
+  CLI install nudge), day-grouped team feed with filters, project cards,
+  team settings (members, roles, invite links, rename, leave). Deploys to
+  Vercel from the `web/` folder; the npm package still ships without it.
+- **Privacy hardening**: memory entries now fall back to the *basename* for
+  files outside the project (an absolute path would leak usernames and
+  machine layout to teammates), and a regression test pins that git remote
+  credentials (`https://user:token@…`) are stripped before any URL is
+  uploaded. The suite grows to 82 offline checks.
+
 ## 0.4.1 — 2026-07-12
 
 - **Team sync is now zero-config for users.** The Supabase backend is baked

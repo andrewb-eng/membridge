@@ -24,6 +24,7 @@ const { startServer, teamPayload } = require('../lib/server');
 const teamsync = require('../lib/teamsync');
 const { createMockSupabase } = require('./mock-supabase');
 const advisorLib = require('../lib/advisor');
+const memorydb = require('../lib/memorydb');
 
 const BIN = path.join(__dirname, '..', 'bin', 'membridge.js');
 const proj1 = path.join(ROOT, 'projects', 'shop-app');
@@ -816,6 +817,223 @@ async function main() {
       assert.ok(md.includes("Teammates' AI activity"), 'team section missing');
       assert.ok(md.includes('Andrew · Codex: Refactor checkout validation'), "Andrew's ask missing");
     });
+
+    // ----- team v2 (002_team_v2.sql): invite links, roles, feed, auto-link -----
+    const MOCK_URL = 'http://127.0.0.1:17945';
+    // Direct RPC helper for endpoints teamsync has no wrapper for (web-only).
+    const rpcAs = async (home, fn, args) => {
+      const saved = process.env.MEMBRIDGE_HOME;
+      process.env.MEMBRIDGE_HOME = home;
+      const creds = await teamsync.getAccessToken(util.getConfig());
+      process.env.MEMBRIDGE_HOME = saved;
+      const res = await fetch(`${MOCK_URL}/rest/v1/rpc/${fn}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', apikey: 'anon-test', Authorization: `Bearer ${creds.accessToken}` },
+        body: JSON.stringify(args),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) throw new Error((data && data.message) || `rpc ${fn}: ${res.status}`);
+      return data;
+    };
+    const gitRepo = (dir, remote) => {
+      fs.mkdirSync(dir, { recursive: true });
+      spawnSync('git', ['init', '-q'], { cwd: dir });
+      spawnSync('git', ['-C', dir, 'remote', 'add', 'origin', remote]);
+    };
+    const HOME_B = path.join(ROOT, 'home-b');
+
+    // Marco (owner) mints an invite link.
+    const inv1 = await teamsync.createInvite(util.getConfig(), team.team_id, {});
+    check('invites: owner mints a short URL-safe token; URL parsing round-trips', () => {
+      assert.ok(/^[A-Za-z0-9_-]{8,}$/.test(inv1.token), `token was ${inv1.token}`);
+      assert.strictEqual(inv1.url, null, 'no web app configured, url must be null');
+      assert.strictEqual(teamsync.parseInviteToken(`https://app.membridge.dev/join/${inv1.token}`), inv1.token);
+      assert.strictEqual(teamsync.parseInviteToken(`  ${inv1.token}  `), inv1.token);
+      process.env.MEMBRIDGE_TEAM_WEB_URL = 'https://app.membridge.dev/';
+      assert.strictEqual(teamsync.inviteUrl(util.getConfig(), inv1.token), `https://app.membridge.dev/join/${inv1.token}`);
+      delete process.env.MEMBRIDGE_TEAM_WEB_URL;
+    });
+
+    // A plain member cannot mint one.
+    process.env.MEMBRIDGE_HOME = HOME_B;
+    let memberInviteErr = null;
+    try {
+      await teamsync.createInvite(util.getConfig(), team.team_id, {});
+    } catch (err) {
+      memberInviteErr = err;
+    }
+    check('invites: a plain member cannot create invite links', () => {
+      assert.ok(memberInviteErr && /owner or admin/i.test(memberInviteErr.message), `said: ${memberInviteErr && memberInviteErr.message}`);
+    });
+
+    // Dana joins by pasting the full /join URL.
+    process.env.MEMBRIDGE_HOME = path.join(ROOT, 'home-d');
+    util.ensureConfig();
+    await teamsync.signup(util.getConfig(), 'dana@test.dev', 'pw-d', 'Dana');
+    const danaJoin = await teamsync.join(util.getConfig(), `https://app.membridge.dev/join/${inv1.token}`);
+    check('invites: redeem via pasted /join URL grants member role only', () => {
+      assert.strictEqual(danaJoin.team_name, 'Acme');
+      const m = mock.members.find(x => x.displayName === 'Dana');
+      assert.ok(m, 'Dana not a member');
+      assert.strictEqual(m.role, 'member');
+      assert.strictEqual(mock.invites.get(inv1.token).useCount, 1, 'use_count not incremented');
+    });
+
+    // Revocation, expiry and max-uses.
+    process.env.MEMBRIDGE_HOME = HOME_A;
+    const inv2 = await teamsync.createInvite(util.getConfig(), team.team_id, { maxUses: 1 });
+    const invExpired = await teamsync.createInvite(util.getConfig(), team.team_id, { expiresAt: new Date(Date.now() - 1000).toISOString() });
+    await teamsync.revokeInvite(util.getConfig(), inv1.token);
+    process.env.MEMBRIDGE_HOME = path.join(ROOT, 'home-e');
+    util.ensureConfig();
+    await teamsync.signup(util.getConfig(), 'erin@test.dev', 'pw-e', 'Erin');
+    let revokedErr = null;
+    try {
+      await teamsync.join(util.getConfig(), inv1.token);
+    } catch (err) {
+      revokedErr = err;
+    }
+    await teamsync.join(util.getConfig(), inv2.token); // burns the single use
+    process.env.MEMBRIDGE_HOME = path.join(ROOT, 'home-f');
+    util.ensureConfig();
+    await teamsync.signup(util.getConfig(), 'frank@test.dev', 'pw-f', 'Frank');
+    let usedErr = null;
+    let expiredErr = null;
+    try {
+      await teamsync.join(util.getConfig(), inv2.token);
+    } catch (err) {
+      usedErr = err;
+    }
+    try {
+      await teamsync.join(util.getConfig(), invExpired.token);
+    } catch (err) {
+      expiredErr = err;
+    }
+    check('invites: revoked, exhausted and expired links are all refused', () => {
+      assert.ok(revokedErr && /revoked/i.test(revokedErr.message), `revoked said: ${revokedErr && revokedErr.message}`);
+      assert.ok(usedErr && /already been used/i.test(usedErr.message), `used said: ${usedErr && usedErr.message}`);
+      assert.ok(expiredErr && /expired/i.test(expiredErr.message), `expired said: ${expiredErr && expiredErr.message}`);
+    });
+
+    // Roles: owner promotes Andrew to admin; as admin he can mint invites.
+    const andrewId = mock.members.find(m => m.displayName === 'Andrew').userId;
+    await rpcAs(HOME_A, 'set_role', { p_team: team.team_id, p_user: andrewId, p_role: 'admin' });
+    process.env.MEMBRIDGE_HOME = HOME_B;
+    const adminInv = await teamsync.createInvite(util.getConfig(), team.team_id, {});
+    let demoteErr = null;
+    try {
+      await rpcAs(HOME_B, 'set_role', { p_team: team.team_id, p_user: andrewId, p_role: 'member' });
+    } catch (err) {
+      demoteErr = err;
+    }
+    check('roles: owner promotes to admin; admin manages invites but not roles', () => {
+      assert.strictEqual(mock.members.find(m => m.userId === andrewId).role, 'admin');
+      assert.ok(adminInv.token, 'admin could not mint an invite');
+      assert.ok(demoteErr && /only the team owner/i.test(demoteErr.message), `said: ${demoteErr && demoteErr.message}`);
+    });
+
+    // Feed read model: one call, filters, keyset pagination.
+    const feedAll = await rpcAs(HOME_A, 'team_feed', { p_team: team.team_id, p_limit: 50 });
+    const feedCodex = await rpcAs(HOME_A, 'team_feed', { p_team: team.team_id, p_source: 'Codex' });
+    const feedPage1 = await rpcAs(HOME_A, 'team_feed', { p_team: team.team_id, p_limit: 1 });
+    const feedPage2 = await rpcAs(HOME_A, 'team_feed', {
+      p_team: team.team_id, p_limit: 1,
+      p_before_created_at: feedPage1[0].created_at, p_before_id: feedPage1[0].id,
+    });
+    check('feed: team_feed joins project names, filters by tool, paginates by keyset', () => {
+      assert.ok(feedAll.length >= 3, `expected >=3 rows, got ${feedAll.length}`);
+      assert.ok(feedAll.every(r => r.project_name === 'shop-app'), 'project_name missing');
+      const authors = new Set(feedAll.map(r => r.author_name));
+      assert.ok(authors.has('Marco') && authors.has('Andrew'), `authors were ${[...authors]}`);
+      assert.ok(feedCodex.length >= 1 && feedCodex.every(r => r.source === 'Codex'), 'tool filter failed');
+      assert.strictEqual(feedPage1.length, 1);
+      assert.strictEqual(feedPage2.length, 1);
+      assert.notStrictEqual(feedPage1[0].id, feedPage2[0].id, 'keyset returned the same row');
+    });
+
+    // Auto-link: Marco links a git-remoted project; credentials in the remote
+    // URL must never reach the server.
+    process.env.MEMBRIDGE_HOME = HOME_A;
+    const projApi = path.join(ROOT, 'projects', 'api-server');
+    gitRepo(projApi, 'https://marco:tok123@github.com/acme/api-server.git');
+    const apiLink = await teamsync.linkProject(util.getConfig(), projApi, team.team_id, 'Acme');
+    check('privacy: git remote credentials are stripped before anything is uploaded', () => {
+      assert.strictEqual(teamsync.repoUrl(projApi), 'github.com/acme/api-server');
+      const row = mock.projects.find(p => p.id === apiLink.projectId);
+      assert.strictEqual(row.repoUrl, 'github.com/acme/api-server');
+      assert.ok(!JSON.stringify(mock.projects).includes('tok123'), 'credential reached the server');
+    });
+
+    // Dana's clone (ssh remote, same repo): suggested, NOT auto-linked.
+    process.env.MEMBRIDGE_HOME = path.join(ROOT, 'home-d');
+    const danaApi = path.join(ROOT, 'projects-d', 'api-server');
+    gitRepo(danaApi, 'git@github.com:acme/api-server.git');
+    const stateD = util.loadState();
+    stateD.projects = { [danaApi]: { events: [{ ts: '2026-07-12T11:00:00.000Z', source: 'Claude Code', kind: 'prompt', text: 'Add rate limiting', session: 'd1' }] } };
+    util.saveState(stateD);
+    const rD = await teamsync.syncTeams();
+    check('auto-link: a matching remote is suggested, never silently shared', () => {
+      assert.ok(rD.suggested.some(k => sameKey(k, danaApi)), `suggested said: ${JSON.stringify(rD.suggested)}`);
+      const s = util.loadState().projects[danaApi].teamSuggestion;
+      assert.ok(s && s.teamName === 'Acme' && s.repoUrl === 'github.com/acme/api-server', `suggestion was ${JSON.stringify(s)}`);
+      assert.ok(!teamsync.loadTeamLink(danaApi), 'project was linked without consent');
+      assert.ok(!mock.entries.some(e => e.ask.includes('rate limiting')), 'entries pushed without consent');
+    });
+    const danaLink = await teamsync.resolveSuggestion(util.getConfig(), danaApi, true);
+    await teamsync.syncTeams();
+    check('auto-link: accepting the suggestion links the clone to the same project row', () => {
+      assert.strictEqual(danaLink.projectId, apiLink.projectId, 'clone got a different project row');
+      assert.ok(!util.loadState().projects[danaApi].teamSuggestion, 'suggestion not cleared');
+      assert.ok(mock.entries.some(e => e.ask.includes('rate limiting')), 'entries not pushed after accept');
+    });
+
+    // Erin opts into full auto-link: her clone links without a prompt.
+    process.env.MEMBRIDGE_HOME = path.join(ROOT, 'home-e');
+    const erinCfg = util.loadUserConfig();
+    erinCfg.team = { ...(erinCfg.team || {}), autoLink: true };
+    util.saveUserConfig(erinCfg);
+    const erinApi = path.join(ROOT, 'projects-e', 'api-server');
+    gitRepo(erinApi, 'https://github.com/acme/api-server.git');
+    const stateE = util.loadState();
+    stateE.projects = { [erinApi]: { events: [] } };
+    util.saveState(stateE);
+    await teamsync.syncTeams();
+    check('auto-link: config team.autoLink=true links matching clones automatically', () => {
+      const link = teamsync.loadTeamLink(erinApi);
+      assert.ok(link, 'not auto-linked');
+      assert.strictEqual(link.projectId, apiLink.projectId);
+    });
+
+    // Privacy: entries never carry a foreign absolute path — basename only.
+    check('privacy: files outside the project fall back to basename in entries', () => {
+      const ents = memorydb.buildEntries(proj1, {
+        events: [
+          { ts: '2026-07-12T12:00:00.000Z', source: 'Claude Code', kind: 'prompt', text: 'tweak global config', session: 'x1' },
+          { ts: '2026-07-12T12:00:01.000Z', source: 'Claude Code', kind: 'edit', file: '/Users/alice/secret-place/config.js' },
+        ],
+      }, util.getConfig());
+      assert.deepStrictEqual(ents[ents.length - 1].files, ['config.js']);
+    });
+
+    // CLI: `membridge join <token>` signs the account up when it is new.
+    // Async spawn, NOT spawnSync: the mock backend lives in this process, and
+    // spawnSync would block the event loop the mock answers from (deadlock).
+    const HOME_CLI2 = path.join(ROOT, 'home-cli2');
+    const joinOut = await new Promise(resolve => {
+      const child = spawn(process.execPath,
+        [BIN, 'join', adminInv.token, '--email', 'cli@test.dev', '--password', 'pw-cli', '--name', 'CLI'],
+        { env: { ...process.env, MEMBRIDGE_HOME: HOME_CLI2 } });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', d => { stdout += d; });
+      child.stderr.on('data', d => { stderr += d; });
+      child.on('close', () => resolve({ stdout, stderr }));
+    });
+    check('CLI: membridge join signs up and joins in one command', () => {
+      assert.ok(/Joined team "Acme"/.test(joinOut.stdout), `join said: ${joinOut.stdout} ${joinOut.stderr}`);
+      assert.ok(mock.members.some(m => m.displayName === 'CLI' && m.role === 'member'), 'CLI user not a member');
+    });
+    process.env.MEMBRIDGE_HOME = HOME_A;
 
     // Stale token: the next call must transparently use the refresh grant.
     const stale = teamsync.loadCredentials();

@@ -14,10 +14,14 @@ function createMockSupabase() {
   const members = [];               // { teamId, userId, displayName, role }
   const projects = [];              // { id, teamId, name, repoUrl }
   const entries = [];               // memory_entries rows
+  const invites = new Map();        // token -> { token, teamId, expiresAt, maxUses, useCount, revokedAt }
   const stats = { refreshCalls: 0, inserts: 0, deniedInserts: 0 };
 
   const uuid = () => crypto.randomUUID();
+  const shortToken = () => crypto.randomBytes(8).toString('base64url').replace(/[^A-Za-z0-9]/g, 'x').slice(0, 10);
   const isMember = (teamId, userId) => members.some(m => m.teamId === teamId && m.userId === userId);
+  const memberRole = (teamId, userId) => (members.find(m => m.teamId === teamId && m.userId === userId) || {}).role || null;
+  const isManager = (teamId, userId) => ['owner', 'admin'].includes(memberRole(teamId, userId));
   const projectTeam = projectId => (projects.find(p => p.id === projectId) || {}).teamId;
 
   function newSession(user) {
@@ -79,6 +83,86 @@ function createMockSupabase() {
         invite_code: teams.get(m.teamId).inviteCode,
       }));
       return json(res, 200, rows);
+    }
+    // ---- schema v2 (002_team_v2.sql) ----
+    if (fn === 'create_invite') {
+      if (!isManager(body.p_team, userId)) return json(res, 403, { message: 'only a team owner or admin can create invite links' });
+      const inv = {
+        token: shortToken(), teamId: body.p_team,
+        expiresAt: body.p_expires_at || null, maxUses: body.p_max_uses || null,
+        useCount: 0, revokedAt: null,
+      };
+      invites.set(inv.token, inv);
+      return json(res, 200, [{ token: inv.token, expires_at: inv.expiresAt, max_uses: inv.maxUses }]);
+    }
+    if (fn === 'revoke_invite') {
+      const inv = invites.get(body.p_token);
+      if (!inv) return json(res, 400, { message: 'unknown invite' });
+      if (!isManager(inv.teamId, userId)) return json(res, 403, { message: 'only a team owner or admin can revoke invite links' });
+      inv.revokedAt = new Date().toISOString();
+      return json(res, 200, null);
+    }
+    if (fn === 'redeem_invite') {
+      const inv = invites.get(body.p_token);
+      if (!inv) return json(res, 400, { message: 'invalid invite link' });
+      if (inv.revokedAt) return json(res, 400, { message: 'this invite link has been revoked' });
+      if (inv.expiresAt && inv.expiresAt <= new Date().toISOString()) return json(res, 400, { message: 'this invite link has expired' });
+      if (inv.maxUses !== null && inv.useCount >= inv.maxUses) return json(res, 400, { message: 'this invite link has already been used' });
+      const team = teams.get(inv.teamId);
+      if (!isMember(team.id, userId)) {
+        members.push({ teamId: team.id, userId, displayName: body.p_display_name, role: 'member' });
+        inv.useCount++;
+      }
+      return json(res, 200, [{ team_id: team.id, team_name: team.name }]);
+    }
+    if (fn === 'remove_member') {
+      if (!isManager(body.p_team, userId)) return json(res, 403, { message: 'only a team owner or admin can remove members' });
+      if (memberRole(body.p_team, body.p_user) === 'owner') return json(res, 400, { message: 'the team owner cannot be removed' });
+      const i = members.findIndex(m => m.teamId === body.p_team && m.userId === body.p_user);
+      if (i !== -1) members.splice(i, 1);
+      return json(res, 200, null);
+    }
+    if (fn === 'set_role') {
+      if (memberRole(body.p_team, userId) !== 'owner') return json(res, 403, { message: 'only the team owner can change roles' });
+      if (!['admin', 'member'].includes(body.p_role)) return json(res, 400, { message: 'role must be admin or member' });
+      const m = members.find(x => x.teamId === body.p_team && x.userId === body.p_user);
+      if (m) m.role = body.p_role;
+      return json(res, 200, null);
+    }
+    if (fn === 'rename_team') {
+      if (!isManager(body.p_team, userId)) return json(res, 403, { message: 'only a team owner or admin can rename the team' });
+      teams.get(body.p_team).name = body.p_name;
+      return json(res, 200, null);
+    }
+    if (fn === 'rotate_invite') {
+      if (!isManager(body.p_team, userId)) return json(res, 403, { message: 'only a team owner or admin can rotate the invite code' });
+      const t = teams.get(body.p_team);
+      t.inviteCode = uuid();
+      for (const inv of invites.values()) if (inv.teamId === body.p_team && !inv.revokedAt) inv.revokedAt = new Date().toISOString();
+      return json(res, 200, t.inviteCode);
+    }
+    if (fn === 'leave_team') {
+      if (memberRole(body.p_team, userId) === 'owner') return json(res, 400, { message: 'the owner cannot leave their own team' });
+      const i = members.findIndex(m => m.teamId === body.p_team && m.userId === userId);
+      if (i !== -1) members.splice(i, 1);
+      return json(res, 200, null);
+    }
+    if (fn === 'team_feed') {
+      if (!isMember(body.p_team, userId)) return json(res, 200, []);
+      let rows = entries
+        .map(e => ({ ...e, project_name: (projects.find(p => p.id === e.project_id) || {}).name }))
+        .filter(e => projectTeam(e.project_id) === body.p_team)
+        .filter(e => !body.p_author || e.author_id === body.p_author)
+        .filter(e => !body.p_project || e.project_id === body.p_project)
+        .filter(e => !body.p_source || e.source === body.p_source)
+        .filter(e => !body.p_since || e.ts >= body.p_since)
+        .filter(e => !body.p_until || e.ts <= body.p_until)
+        .sort((a, b) => b.created_at.localeCompare(a.created_at) || b.id - a.id);
+      if (body.p_before_created_at) {
+        rows = rows.filter(e => e.created_at < body.p_before_created_at ||
+          (e.created_at === body.p_before_created_at && e.id < body.p_before_id));
+      }
+      return json(res, 200, rows.slice(0, Math.min(Math.max(body.p_limit || 50, 1), 200)));
     }
     json(res, 404, { message: `unknown rpc ${fn}` });
   }
@@ -149,11 +233,20 @@ function createMockSupabase() {
       if (url.pathname === '/rest/v1/memory_entries') {
         return handleEntries(res, url, req.method, body, authedUser(req));
       }
+      if (url.pathname === '/rest/v1/projects' && req.method === 'GET') {
+        // Auto-link fetch: RLS means only projects in the caller's teams.
+        const userId = authedUser(req);
+        if (!userId) return json(res, 401, { message: 'not authenticated' });
+        const rows = projects
+          .filter(p => isMember(p.teamId, userId) && p.repoUrl)
+          .map(p => ({ id: p.id, team_id: p.teamId, name: p.name, repo_url: p.repoUrl }));
+        return json(res, 200, rows);
+      }
       json(res, 404, { message: 'not found' });
     });
   });
 
-  return { server, users, teams, members, projects, entries, stats };
+  return { server, users, teams, members, projects, entries, invites, stats };
 }
 
 module.exports = { createMockSupabase };
