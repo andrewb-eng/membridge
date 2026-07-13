@@ -6,7 +6,7 @@ name: Build app
 
 on:
   push:
-    branches: [master]
+    branches: [master, brown]
   workflow_dispatch:
   release:
     types: [published]
