@@ -208,6 +208,8 @@ function cmdStatus() {
   console.log(`Home:      ${util.homeDir()}`);
   console.log(`Interval:  ${config.intervalSec}s   Targets: ${config.targets.join(', ')}`);
   console.log(`Autostart: ${autostart.isEnabled() ? 'enabled' : 'disabled'}`);
+  const distillOn = !config.distill || config.distill.enabled !== false;
+  console.log(`Distill:   ${distillOn ? 'enabled' : 'disabled'} — Claude Code hook ${hooks.isHookInstalled() ? 'installed' : 'not installed (run \`membridge setup-hooks\`)'}`);
   const projects = Object.entries(state.projects || {});
   console.log(`Projects:  ${projects.length}`);
   for (const [key, proj] of projects) {
