@@ -376,10 +376,15 @@ async function main() {
   await new Promise(r => mockApi.listen(17944, '127.0.0.1', r));
 
   const PORT = 17941;
+  const apiClaudeSettings = path.join(ROOT, 'claude-settings-api.json');
   const child = spawn(process.execPath, [BIN, 'daemon'], {
-    env: { ...process.env, MEMBRIDGE_PORT: String(PORT), MEMBRIDGE_API_BASE: 'http://127.0.0.1:17944' },
+    env: {
+      ...process.env, MEMBRIDGE_PORT: String(PORT), MEMBRIDGE_API_BASE: 'http://127.0.0.1:17944',
+      MEMBRIDGE_CLAUDE_SETTINGS: apiClaudeSettings,
+    },
     stdio: 'ignore',
   });
+  process.env.MEMBRIDGE_CLAUDE_SETTINGS = apiClaudeSettings; // same file, so hooks.isHookInstalled() here agrees
   const base = `http://127.0.0.1:${PORT}`;
   try {
     await waitForHttp(`${base}/api/status`);
@@ -404,6 +409,11 @@ async function main() {
       assert.ok(pageHtml.includes("path = '/api/team/' + kind"), 'account auth flow missing');
       assert.ok(pageHtml.includes('/api/team/create'), 'team creation UI missing');
       assert.ok(pageHtml.includes('/api/team/link'), 'project linking UI missing');
+      assert.ok(pageHtml.includes('/api/team/revoke-invite'), 'invite revoke UI missing');
+      assert.ok(pageHtml.includes("Revoke this invite link?"), 'invite revoke confirmation missing');
+      assert.ok(pageHtml.includes('data-team-form="invite-options"'), 'invite options form missing');
+      assert.ok(pageHtml.includes('expiresDays'), 'invite expiry field missing');
+      assert.ok(pageHtml.includes('maxUses'), 'invite max-uses field missing');
       assert.ok(pageHtml.includes("return 'auth'"), 'protected-route gate missing');
     });
     check('dashboard page has the Copy for AI button', () => {
@@ -417,6 +427,9 @@ async function main() {
       assert.ok(pageHtml.includes('Syncing'), 'sync section missing');
       assert.ok(pageHtml.includes('Anthropic API key'), 'key section missing');
       assert.ok(pageHtml.includes('Planner model'), 'model section missing');
+      assert.ok(pageHtml.includes('Advanced: self-hosted backend'), 'self-hosted backend card missing');
+      assert.ok(pageHtml.includes('stTeamUrl'), 'self-hosted backend URL field missing');
+      assert.ok(pageHtml.includes('stTeamAnonKey'), 'self-hosted backend anon key field missing');
     });
     const graphRes = await fetch(`${base}/api/graph`);
     const graphText = await graphRes.text();
@@ -486,6 +499,42 @@ async function main() {
       assert.ok(p && Array.isArray(p.tools), 'tools missing');
       assert.ok(p.tools.includes('Claude Code') && p.tools.includes('Codex'), `tools said: ${JSON.stringify(p && p.tools)}`);
     });
+    // Feature 3: read-only scan/discovery view (dashboard equivalent of `membridge scan`)
+    const scanRes = await fetch(`${base}/api/scan`);
+    const scan = await scanRes.json();
+    check('/api/scan reports adapter roots with correct exists flags', () => {
+      assert.strictEqual(scanRes.status, 200);
+      const claudeAdapterRoot = scan.adapters.find(a => a.displayName === 'Claude Code');
+      assert.ok(claudeAdapterRoot, 'Claude Code adapter missing');
+      assert.strictEqual(claudeAdapterRoot.root, process.env.MEMBRIDGE_CLAUDE_DIR);
+      assert.strictEqual(claudeAdapterRoot.exists, true, 'existing Claude root reported as missing');
+      const codexAdapterRoot = scan.adapters.find(a => a.displayName === 'Codex');
+      assert.ok(codexAdapterRoot, 'Codex adapter missing');
+      assert.strictEqual(codexAdapterRoot.exists, true, 'existing Codex root reported as missing');
+    });
+    check('/api/scan reports project counts and per-source breakdown', () => {
+      assert.ok(scan.projectCount >= 3, `expected >=3 projects, got ${scan.projectCount}`);
+      const p1 = scan.projects.find(p => p.path.toLowerCase() === proj1.toLowerCase());
+      assert.ok(p1, 'shop-app missing from scan');
+      // proj1's session files accumulate events across earlier tests in this run (this is a
+      // fresh from-byte-0 scan), so assert the mixed-source breakdown is present with lower
+      // bounds rather than brittle exact counts tied to test execution order.
+      assert.ok(p1.bySource['Claude Code'] >= 4, `expected >=4 Claude Code events, got ${JSON.stringify(p1.bySource)}`);
+      assert.ok(p1.bySource.Codex >= 1, `expected >=1 Codex event, got ${JSON.stringify(p1.bySource)}`);
+      assert.ok(p1.bySource.MyTool >= 1, `expected >=1 MyTool event, got ${JSON.stringify(p1.bySource)}`);
+    });
+    check('/api/scan flags paused projects', () => {
+      const p2 = scan.projects.find(p => p.path.toLowerCase() === proj2.toLowerCase());
+      assert.ok(p2, 'excluded-app missing from scan');
+      assert.strictEqual(p2.paused, true, 'excluded project not flagged paused');
+      const p1 = scan.projects.find(p => p.path.toLowerCase() === proj1.toLowerCase());
+      assert.strictEqual(p1.paused, false, 'active project incorrectly flagged paused');
+    });
+    check('dashboard page has the scan/discovery modal', () => {
+      assert.ok(pageHtml.includes('scanOverlay'), 'scan overlay missing');
+      assert.ok(pageHtml.includes('/api/scan'), 'scan fetch missing');
+      assert.ok(pageHtml.includes('Detected tools'), 'scan modal title missing');
+    });
     const detRes = await fetch(`${base}/api/project?path=${encodeURIComponent(proj1)}`);
     const det = await detRes.json();
     const detBad = await fetch(`${base}/api/project?path=${encodeURIComponent(path.join(ROOT, 'no-such-dir'))}`);
@@ -549,6 +598,72 @@ async function main() {
       assert.strictEqual(viaEnv.apiKey, 'sk-env-fallback');
       assert.strictEqual(advisorLib.getAdvisorConfig({}).source, null, 'no key should mean null source');
     });
+
+    // Session summaries card: /api/settings exposes hookInstalled + distill,
+    // and toggling distill.enabled installs/removes the Claude Code Stop hook
+    // AND records consent — otherwise the first-run popup (needsConsentPrompt)
+    // would keep nagging even after the Settings toggle already acted.
+    const consentLib = require('../lib/consent');
+    const stFresh = await (await fetch(`${base}/api/settings`)).json();
+    check('settings: hookInstalled + distill fields are reported', () => {
+      assert.strictEqual(stFresh.hookInstalled, false, 'hook should not be installed yet');
+      assert.deepStrictEqual(stFresh.distill, { enabled: true, consent: null, minEdits: 1, checkpointEvery: 4 });
+    });
+    const stDistillOn = await (await post(`${base}/api/settings`, { distill: { enabled: true } })).json();
+    check('settings: enabling summaries installs the Claude Code Stop hook and grants consent', () => {
+      assert.strictEqual(stDistillOn.distill.enabled, true);
+      assert.strictEqual(stDistillOn.distill.consent, 'granted', 'consent not recorded on enable');
+      assert.strictEqual(stDistillOn.hookInstalled, true, 'hookInstalled not reflected after enabling');
+      assert.strictEqual(hooks.isHookInstalled(), true, 'hook file was not actually written');
+      assert.strictEqual(consentLib.needsConsentPrompt(util.getConfig()), false,
+        'first-run popup would still nag after the Settings toggle enabled summaries');
+    });
+    const stDistillOff = await (await post(`${base}/api/settings`, { distill: { enabled: false } })).json();
+    check('settings: disabling summaries removes the Claude Code Stop hook and declines consent', () => {
+      assert.strictEqual(stDistillOff.distill.enabled, false);
+      assert.strictEqual(stDistillOff.distill.consent, 'declined', 'consent not recorded on disable');
+      assert.strictEqual(stDistillOff.hookInstalled, false, 'hookInstalled not reflected after disabling');
+      assert.strictEqual(hooks.isHookInstalled(), false, 'hook file was not actually removed');
+      assert.strictEqual(consentLib.needsConsentPrompt(util.getConfig()), false,
+        'first-run popup would still nag after the Settings toggle disabled summaries');
+    });
+    const stDistillFields = await (await post(`${base}/api/settings`, {
+      distill: { enabled: false, minEdits: 3, checkpointEvery: 7 },
+    })).json();
+    check('settings: minEdits/checkpointEvery are saved when valid', () => {
+      assert.strictEqual(stDistillFields.distill.minEdits, 3);
+      assert.strictEqual(stDistillFields.distill.checkpointEvery, 7);
+    });
+    const stDistillInvalid = await (await post(`${base}/api/settings`, {
+      distill: { minEdits: 0, checkpointEvery: 'nope' },
+    })).json();
+    check('settings: invalid minEdits/checkpointEvery are rejected, previous values kept', () => {
+      assert.strictEqual(stDistillInvalid.distill.minEdits, 3, 'invalid minEdits (0) was accepted');
+      assert.strictEqual(stDistillInvalid.distill.checkpointEvery, 7, 'invalid checkpointEvery (non-numeric) was accepted');
+    });
+    const stTeamBackend = await (await post(`${base}/api/settings`, {
+      team: { url: 'https://selfhost.supabase.co ', anonKey: ' anon-test-key ' },
+    })).json();
+    check('settings: self-hosted team backend is saved and reported', () => {
+      assert.strictEqual(stTeamBackend.team.url, 'https://selfhost.supabase.co');
+      assert.strictEqual(stTeamBackend.team.anonKey, 'anon-test-key');
+      assert.strictEqual(stTeamBackend.team.customBackend, true);
+      const cfg = util.getConfig();
+      assert.strictEqual(cfg.team.url, 'https://selfhost.supabase.co');
+      assert.strictEqual(cfg.team.anonKey, 'anon-test-key');
+    });
+    const stTeamBackendReset = await (await post(`${base}/api/settings`, {
+      team: { url: '', anonKey: '' },
+    })).json();
+    check('settings: self-hosted team backend can reset to default', () => {
+      assert.deepStrictEqual(stTeamBackendReset.team, { url: '', anonKey: '', customBackend: false });
+      const cfg = util.getConfig();
+      assert.strictEqual(cfg.team.url, '');
+      assert.strictEqual(cfg.team.anonKey, '');
+    });
+    // Leave distill in its default post-first-run-consent-tests-friendly state
+    // for any later checks in this file that rely on the default config shape.
+    await post(`${base}/api/settings`, { distill: { enabled: true, minEdits: 1, checkpointEvery: 4 } });
 
     // M3: roadmap generation (the mock returns a canned plan and captures the request)
     const planNoKey = await post(`${base}/api/plan/generate`, { path: proj1, goal: 'Ship checkout' });
@@ -626,6 +741,30 @@ async function main() {
       assert.strictEqual(p.prompts.length, 0, 'empty project reported prompts');
       assert.strictEqual(addAgain.added, false, 'second add not reported as already tracked');
       assert.strictEqual(addBad.status, 400, 'nonexistent path was accepted');
+    });
+
+    // Remove block: unlike delete, this only strips the injected block from
+    // context files. History (.membridge + state) stays put, and a plain
+    // sync brings the block right back.
+    const removeRes = await (await post(`${base}/api/projects/remove`, { path: proj1 })).json();
+    check('remove-block strips the block but keeps memory + state', () => {
+      assert.strictEqual(removeRes.removed, true, `remove said: ${JSON.stringify(removeRes)}`);
+      const md = claudeMd();
+      assert.ok(!md.includes(digest.BEGIN), 'block not stripped from CLAUDE.md');
+      assert.ok(md.startsWith('# Shop app'), 'original heading lost');
+      assert.ok(!fs.existsSync(path.join(proj1, 'AGENTS.md')), 'block-only AGENTS.md not deleted');
+      assert.ok(fs.existsSync(path.join(proj1, '.membridge')), '.membridge dir was removed');
+      assert.ok(fs.existsSync(path.join(proj1, '.membridge', 'memory.md')), 'memory log was removed');
+      const state = util.loadState();
+      const key = Object.keys(state.projects).find(k => k.toLowerCase() === proj1.toLowerCase());
+      assert.ok(key && state.projects[key].events.length, 'project state/history was wiped');
+    });
+
+    await post(`${base}/api/sync`, { project: proj1 });
+    check('sync after remove-block re-adds the block', () => {
+      const md = claudeMd();
+      assert.ok(md.includes(digest.BEGIN), 'block not re-added after sync');
+      assert.ok(fs.existsSync(path.join(proj1, 'AGENTS.md')), 'AGENTS.md not recreated after sync');
     });
 
     const delRes = await (await post(`${base}/api/projects/delete`, { path: proj1 })).json();
@@ -751,6 +890,41 @@ async function main() {
       assert.ok(!JSON.stringify(dashboardTeam).includes(credsA.accessToken), 'access token exposed');
       assert.ok(!JSON.stringify(dashboardTeam).includes(credsA.refreshToken), 'refresh token exposed');
     });
+    const PORT4 = 17946;
+    const srv4 = startServer(PORT4, { retries: 0 });
+    try {
+      const base4 = `http://127.0.0.1:${PORT4}`;
+      await waitForHttp(`${base4}/api/status`);
+      const apiInv = await (await fetch(`${base4}/api/team/invite`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ teamId: team.team_id }),
+      })).json();
+      const optInv = await (await fetch(`${base4}/api/team/invite`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ teamId: team.team_id, expiresDays: '7', maxUses: '3' }),
+      })).json();
+      const revokeRes = await fetch(`${base4}/api/team/revoke-invite`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: `https://app.membridge.dev/join/${apiInv.token}` }),
+      });
+      const revokeJson = await revokeRes.json();
+      const optRow = mock.invites.get(optInv.token);
+      check('dashboard: /api/team/revoke-invite revokes pasted invite links', () => {
+        assert.strictEqual(revokeRes.status, 200);
+        assert.strictEqual(revokeJson.revoked, true);
+        assert.ok(mock.invites.get(apiInv.token).revokedAt, 'invite was not revoked');
+      });
+      check('dashboard: /api/team/invite passes expiry and max-use options', () => {
+        assert.ok(optRow.expiresAt, 'expiry was not passed');
+        assert.strictEqual(optRow.maxUses, 3);
+        assert.strictEqual(optInv.max_uses, 3);
+      });
+    } finally {
+      srv4.close();
+    }
 
     // proj1 was deleted+revived earlier, so its live history is the single
     // "Ship the checkout flow" ask — enough to prove the push path end to end.

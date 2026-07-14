@@ -151,7 +151,7 @@ const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();
 } else {
-  app.whenReady().then(() => {
+  app.whenReady().then(async () => {
     // pure menu-bar app on macOS: no dock icon
     if (process.platform === 'darwin' && app.dock) app.dock.hide();
 
