@@ -27,6 +27,7 @@ const advisorLib = require('../lib/advisor');
 const memorydb = require('../lib/memorydb');
 const claudeAdapter = require('../lib/adapters/claude-code');
 const codexAdapter = require('../lib/adapters/codex');
+const hooks = require('../lib/hooks');
 
 const BIN = path.join(__dirname, '..', 'bin', 'membridge.js');
 const proj1 = path.join(ROOT, 'projects', 'shop-app');
@@ -1415,8 +1416,9 @@ async function main() {
     const agents = read(path.join(projR, 'AGENTS.md'));
     assert.ok(agents.includes('summaries.jsonl'), 'AGENTS.md fallback instruction missing');
     assert.ok(agents.includes('"did"'), 'fallback instruction lacks the line schema');
+    assert.ok(agents.includes('never edit earlier lines'), 'fallback lacks the append-more-lines guidance');
     const claude = richMd();
-    assert.ok(!claude.includes('append ONE line'), 'CLAUDE.md got the Codex fallback instruction');
+    assert.ok(!claude.includes('append a line to'), 'CLAUDE.md got the Codex fallback instruction');
   });
 
   // setup-hooks / remove-hooks: surgical merge into a user's settings.json.
@@ -1516,6 +1518,142 @@ async function main() {
     assert.ok(after > before, `offset did not advance: ${before} -> ${after}`);
     assert.ok(richMd().includes('metrics counter for retry exhaustion'), 'appended summary not rendered (latest-in-tier wins)');
   });
+
+  // --- 11. checkpoints: staleness-based re-blocking + the "go deeper" view ---
+  // A project whose edit count (state) and checkpoint lines (disk) we control
+  // directly, so the block/no-block thresholds can be exercised exactly.
+  const projCk = path.join(ROOT, 'projects', 'checkpoint-app');
+  fs.mkdirSync(path.join(projCk, '.membridge'), { recursive: true });
+  const ckSummaries = path.join(projCk, '.membridge', 'summaries.jsonl');
+  const ckTs = i => `2026-07-14T00:00:${String(i).padStart(2, '0')}.000Z`;
+  const setCkEdits = n => {
+    const st = util.loadState();
+    st.projects[projCk] = {
+      events: Array.from({ length: n }, (_, i) => ({
+        ts: ckTs(i), source: 'Claude Code', kind: 'edit', file: path.join(projCk, `f${i}.js`), session: 'ck1',
+      })),
+    };
+    util.saveState(st);
+  };
+  const writeCkLines = m => fs.writeFileSync(ckSummaries,
+    Array.from({ length: m }, (_, i) => JSON.stringify({ session: 'ck1', ts: ckTs(i), did: `Checkpoint ${i}: did real work worth summarizing here.` })).join('\n') + (m ? '\n' : ''));
+  const runCk = extra => spawnSync(process.execPath, [BIN, 'hook', 'stop'], {
+    input: JSON.stringify({ session_id: 'ck1', cwd: projCk, stop_hook_active: false, ...extra }),
+    encoding: 'utf8', env: { ...process.env },
+  });
+  const ckBlocked = out => out.status === 0 && !!out.stdout.trim() && JSON.parse(out.stdout).decision === 'block';
+
+  check('checkpoint: re-blocks only when checkpointEvery further edits accrue (minEdits 1, every 4)', () => {
+    writeCkLines(0); setCkEdits(1); // 0 lines, due at minEdits (1)
+    assert.ok(ckBlocked(runCk()), 'first checkpoint did not block at minEdits');
+    writeCkLines(1); setCkEdits(2); // 1 line, next due at 1+1*4=5
+    assert.ok(!ckBlocked(runCk()), 'blocked too early (minEdits+1 with 1 line)');
+    setCkEdits(5); // reaches the 2nd threshold
+    assert.ok(ckBlocked(runCk()), 'did not block at minEdits+4 with 1 line');
+    writeCkLines(2); setCkEdits(9); // 2 lines, next due at 1+2*4=9
+    assert.ok(ckBlocked(runCk()), 'did not block again at minEdits+8 with 2 lines');
+  });
+  check('checkpoint: loop guard short-circuits even when a checkpoint is due', () => {
+    writeCkLines(0); setCkEdits(5);
+    const out = runCk({ stop_hook_active: true });
+    assert.strictEqual(out.status, 0);
+    assert.strictEqual(out.stdout, '');
+  });
+  check('checkpoint: blockReason scopes later checkpoints to only new work', () => {
+    const first = hooks.blockReason('/p/.membridge/summaries.jsonl', 'ck1', 0);
+    const later = hooks.blockReason('/p/.membridge/summaries.jsonl', 'ck1', 2);
+    assert.ok(!/since your previous summary/i.test(first), 'first checkpoint should not reference prior lines');
+    assert.ok(/only the work done since your previous summary/i.test(later), 'later checkpoint must scope to new work');
+    assert.ok(later.includes('2 already written'), 'later checkpoint should state the count');
+    assert.ok(later.includes('do not repeat or modify earlier lines'), 'later checkpoint must forbid editing earlier lines');
+  });
+  check('checkpoint: countSummaryLines ignores malformed lines, empty did, and other sessions', () => {
+    fs.writeFileSync(ckSummaries,
+      'not json {\n' +
+      JSON.stringify({ session: 'ck1', ts: ckTs(0), did: 'first real checkpoint' }) + '\n' +
+      JSON.stringify({ session: 'other', ts: ckTs(1), did: 'a different session' }) + '\n' +
+      JSON.stringify({ session: 'ck1', ts: ckTs(2), did: '   ' }) + '\n' +
+      JSON.stringify({ session: 'ck1', ts: ckTs(3), did: 'second real checkpoint' }) + '\n');
+    assert.strictEqual(hooks.countSummaryLines(projCk, 'ck1'), 2);
+    assert.strictEqual(hooks.countSummaryLines(projCk, 'nope'), 0);
+    assert.strictEqual(hooks.hasSummaryLine(projCk, 'ck1'), true);
+  });
+  check('checkpoint: checkpointEvery below 1 or non-finite falls back to 4', () => {
+    const rawCfg = util.loadUserConfig();
+    rawCfg.distill = { enabled: true, minEdits: 1, checkpointEvery: 0 };
+    util.saveUserConfig(rawCfg);
+    writeCkLines(1); setCkEdits(2); // with every=4 → threshold 5 → no block; with a bad every=0 → threshold 1 → block
+    const out = runCk();
+    delete rawCfg.distill;
+    util.saveUserConfig(rawCfg);
+    assert.ok(!ckBlocked(out), 'checkpointEvery 0 was not clamped to the default 4');
+  });
+  check('checkpoint: sessionSummaries returns only Distilled when both tiers exist, time-ordered', () => {
+    const evs = [
+      { kind: 'summary', source: 'Claude Code', session: 's', ts: '2026-07-14T01:00:00.000Z', text: 'harvested middle' },
+      { kind: 'summary', source: 'Distilled', session: 's', ts: '2026-07-14T00:30:00.000Z', text: 'distilled early' },
+      { kind: 'summary', source: 'Distilled', session: 's', ts: '2026-07-14T02:00:00.000Z', text: 'distilled late' },
+      { kind: 'summary', source: 'Distilled', session: 'other', ts: '2026-07-14T00:00:00.000Z', text: 'wrong session' },
+    ];
+    assert.deepStrictEqual(digest.sessionSummaries(evs, 's').map(e => e.text), ['distilled early', 'distilled late']);
+    const harvOnly = [{ kind: 'summary', source: 'Codex', session: 's', ts: 't', text: 'only harvested' }];
+    assert.deepStrictEqual(digest.sessionSummaries(harvOnly, 's').map(e => e.text), ['only harvested']);
+  });
+
+  // Three distilled checkpoints in one session, driven end to end.
+  const projSeq = path.join(ROOT, 'projects', 'seq-app');
+  fs.mkdirSync(path.join(projSeq, 'src'), { recursive: true });
+  const seqCDir = path.join(process.env.MEMBRIDGE_CLAUDE_DIR, 'slug-seq-app');
+  fs.mkdirSync(seqCDir, { recursive: true });
+  fs.writeFileSync(path.join(seqCDir, 'seq1.jsonl'), jsonl([
+    { type: 'user', message: { role: 'user', content: 'Migrate the auth module to tokens' }, cwd: projSeq, timestamp: '2026-07-14T03:00:00.000Z' },
+    { type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', name: 'Edit', input: { file_path: path.join(projSeq, 'src', 'auth.js') } }] }, cwd: projSeq, timestamp: '2026-07-14T03:01:00.000Z' },
+  ]));
+  fs.mkdirSync(path.join(projSeq, '.membridge'), { recursive: true });
+  fs.writeFileSync(path.join(projSeq, '.membridge', 'summaries.jsonl'),
+    JSON.stringify({ session: 'seq1', ts: '2026-07-14T03:05:00.000Z', did: 'Checkpoint one: scaffolded the token store and swapped the session cookie for a bearer header.' }) + '\n' +
+    JSON.stringify({ session: 'seq1', ts: '2026-07-14T03:15:00.000Z', did: 'Checkpoint two: migrated the login and refresh endpoints; rotated api_key=sk-seq-secret-42 along the way.' }) + '\n' +
+    JSON.stringify({ session: 'seq1', ts: '2026-07-14T03:25:00.000Z', did: 'Checkpoint three: deleted the legacy cookie path and updated every test to the token flow.' }) + '\n');
+  syncOnce();
+
+  check('checkpoint: block shows the latest checkpoint; memory.md/json hold the full ordered sequence', () => {
+    const claude = read(path.join(projSeq, 'CLAUDE.md'));
+    assert.ok(claude.includes('Result: Checkpoint three'), 'block should show the latest checkpoint');
+    assert.ok(!claude.includes('Checkpoint one') && !claude.includes('Checkpoint two'), 'block should not show earlier checkpoints');
+    assert.ok(!claude.includes('sk-seq-secret-42'), 'secret leaked into the block');
+    const mem = read(path.join(projSeq, '.membridge', 'memory.md'));
+    assert.ok(mem.includes('Checkpoints:'), 'memory.md checkpoints header missing');
+    const i1 = mem.indexOf('Checkpoint one'), i2 = mem.indexOf('Checkpoint two'), i3 = mem.indexOf('Checkpoint three');
+    assert.ok(i1 > -1 && i2 > i1 && i3 > i2, `memory.md checkpoints out of order: ${[i1, i2, i3]}`);
+    assert.ok(!mem.includes('sk-seq-secret-42'), 'secret leaked into memory.md');
+    const db = JSON.parse(read(path.join(projSeq, '.membridge', 'memory.json')));
+    const entry = db.entries.find(e => Array.isArray(e.checkpoints));
+    assert.ok(entry && entry.checkpoints.length === 3, `checkpoints array missing/wrong length: ${entry && entry.checkpoints.length}`);
+    assert.ok(entry.checkpoints[2].includes('Checkpoint three'), 'checkpoints array out of order');
+    assert.ok(!JSON.stringify(db).includes('sk-seq-secret-42'), 'secret leaked into memory.json');
+  });
+
+  const mock4 = createMockSupabase();
+  await new Promise(r => mock4.server.listen(17948, '127.0.0.1', r));
+  process.env.MEMBRIDGE_TEAM_URL = 'http://127.0.0.1:17948';
+  process.env.MEMBRIDGE_TEAM_ANON_KEY = 'anon-test';
+  try {
+    await teamsync.signup(util.getConfig(), 'seq@test.dev', 'pw-s', 'Seq');
+    const teamS = await teamsync.createTeam(util.getConfig(), 'SeqTeam');
+    await teamsync.linkProject(util.getConfig(), projSeq, teamS.team_id, 'SeqTeam');
+    await teamsync.syncTeams({ project: projSeq });
+    check('checkpoint: team push carries only the latest checkpoint, redacted', () => {
+      const row = mock4.entries.find(e => e.ask.includes('Migrate the auth module'));
+      assert.ok(row, `seq entry not pushed (${mock4.entries.length} rows)`);
+      assert.ok(row.summary && row.summary.includes('Checkpoint three'), `push summary was: ${row.summary}`);
+      assert.ok(!row.summary.includes('Checkpoint one') && !row.summary.includes('Checkpoint two'), 'push carried an older checkpoint');
+      assert.ok(!JSON.stringify(mock4.entries).includes('sk-seq-secret-42'), 'secret reached the server');
+    });
+  } finally {
+    delete process.env.MEMBRIDGE_TEAM_URL;
+    delete process.env.MEMBRIDGE_TEAM_ANON_KEY;
+    await new Promise(r => mock4.server.close(r));
+  }
 
   // --- summary ---
   const failed = results.filter(([, e]) => e);
