@@ -2330,6 +2330,14 @@ async function main() {
     assert.deepStrictEqual(n.files, ['a.js', 'b.js']);
     assert.strictEqual(n.cursor, null);
   });
+  check('feed.normalizeLocal picks up meta.authorId when provided', () => {
+    const e = { ts: '2026-07-14T06:00:00Z', source: 'Claude Code', ask: 'x', files: [] };
+    const withId = feed.normalizeLocal(e, { projectPath: '/p', projectName: 'p', projectId: null, authorId: 'me' });
+    assert.strictEqual(withId.authorId, 'me');
+    // Backward compatible: meta without authorId stays null (self identity unchanged).
+    const noId = feed.normalizeLocal(e, { projectPath: '/p', projectName: 'p', projectId: null });
+    assert.strictEqual(noId.authorId, null);
+  });
   check('feed.normalizeLocal treats a missing summary as in-progress (summary=null)', () => {
     const n = feed.normalizeLocal({ ts: '2026-07-14T06:00:00Z', source: 'Codex', ask: 'do a thing', files: [] },
       { projectPath: '/p', projectName: 'p', projectId: null });
