@@ -460,6 +460,13 @@ async function main() {
       assert.ok(Array.isArray(g.links) && g.links.some(l => l.type === 'member'), 'member links missing');
       assert.ok(!graphText.includes('sk-test1234567890abcdef'), 'secret leaked over HTTP');
     });
+    const feedRes = await (await fetch(`${base}/api/feed?limit=50`)).json();
+    check('/api/feed returns a merged entries array with a degradation flag', () => {
+      assert.ok(Array.isArray(feedRes.entries), 'entries is an array');
+      assert.ok('teamUnavailable' in feedRes, 'response carries the teamUnavailable flag');
+      assert.ok(feedRes.entries.every(e => 'summary' in e && 'origin' in e),
+        'every entry is normalized (has origin + summary)');
+    });
     const projects = await (await fetch(`${base}/api/projects`)).json();
     check('dashboard /api/projects lists the project with prompts', () => {
       const p = projects.find(x => x.path.toLowerCase() === proj1.toLowerCase());
