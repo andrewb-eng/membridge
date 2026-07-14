@@ -1,22 +1,83 @@
-# MemBridge — one shared memory for your team's AI coding tools
+# MemBridge — your team's AI work, in one place
 
 [![CI](https://github.com/mmelika/membridge/actions/workflows/ci.yml/badge.svg)](https://github.com/mmelika/membridge/actions/workflows/ci.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![node >= 18](https://img.shields.io/badge/node-%3E%3D18-brightgreen.svg)](package.json)
 
-**Your Claude Code knows what your teammate's Codex did 30 seconds ago.**
+**One app where your whole team sees what everyone's AI coding tools are
+doing — and where the tools themselves stay on the same page.**
 
-MemBridge is a team collaboration tool for AI-assisted development. A tiny
-background daemon watches every AI coding tool's session logs, distills a
-brief per-project memory, and injects it into the context files every tool
-reads — so Claude Code, Codex, Gemini CLI, and any other agent stay on the
-same page. Link a project to your team and that memory flows both ways:
-everyone's tools see what everyone else's tools did, with attribution, and
-the **Team hub** in the dashboard shows the whole team's AI activity in one
-feed.
+MemBridge is a team collaboration app for AI-assisted development. It lives
+in your menu bar, and its dashboard is the product: a **Team hub** with a
+live feed of every ask your teammates gave their AI tools, member and
+project pages, invites and roles — plus, underneath it all, a memory engine
+that keeps Claude Code, Codex, Gemini CLI, and any other agent aware of each
+other's work, across tools *and* across teammates.
 
-It starts on one machine with zero setup — no cloud, no accounts, no API
-keys — and extends to your whole team when you're ready.
+So when Andrew's Codex refactors checkout validation, you see it in the
+feed — and your Claude Code already knows about it the next time you open
+the project.
+
+Everything starts local: no cloud, no accounts, no API keys until you decide
+to connect a team. (Prefer a terminal? Everything the app does is also a
+[CLI](#the-cli).)
+
+## The Team hub
+
+Open the **Team** tab and you get a real collaboration hub:
+
+- **Activity feed** — everything your team's AI tools did, grouped by day:
+  who asked, which tool, which project, what the ask was, and the files it
+  touched. Filter by member, project, or tool; page back through history.
+- **Members** — who's on the team, their role, when they were last active.
+  Click a member for their page: their projects and their recent work as a
+  timeline. Owners and admins manage roles or remove members; anyone can
+  leave.
+- **Team projects** — every project the team shares, with contributor counts
+  and last activity. Click one for its page: contributors and the project's
+  full feed. Projects you also have locally link back to their local page.
+- **Invites** — mint invite links from the hub header, with optional expiry
+  and max-use caps; copy, revoke, done.
+- **Team settings** — rename the team, rotate the legacy invite code, leave.
+- **Multi-team** — a switcher in the hub header if you're on more than one.
+
+Signing up, creating a team, inviting people, joining, and linking projects
+all happen right in the app — no terminal required.
+
+**Teammates who haven't installed anything** can still follow along: the
+hosted **web workspace** ([`web/`](web/README.md), Next.js + Supabase) opens
+invite links at `/join/<token>`, shows the same day-grouped feed with
+filters, project stats, and member/role/invite management from any browser.
+
+## The rest of the dashboard
+
+- **Overview** — every local project with AI activity: tool badges, last
+  activity, paused state. A **Scan** view shows exactly what MemBridge
+  detected — which tools, which session folders, which projects — read-only.
+- **Project pages** — the full ask-by-ask history with the files each ask
+  touched; a Memory tab showing exactly what gets injected where, with
+  pause/resume, delete, and **Remove block**; and **Copy for AI**, which
+  puts a trimmed, redacted digest on your clipboard for pasting into
+  ChatGPT, claude.ai, or any web AI that can't see your disk.
+- **Neural map** — a force-directed map of every chat across every project,
+  linked by shared files and shared ideas.
+- **Settings** — session summaries (the distillation toggle and checkpoint
+  knobs), bring-your-own-key and planner model, sync interval and target
+  files, and a self-hosted-backend card for operators. No config-file
+  editing required.
+
+## How it works — the memory engine
+
+Every AI coding assistant keeps its own siloed session history. Claude Code
+doesn't know what Codex did this morning; your Codex has no idea what your
+teammate's Claude Code shipped an hour ago.
+
+But every major tool already reads a per-project context file at startup —
+`CLAUDE.md` for Claude Code, `AGENTS.md` for Codex and most agents,
+`GEMINI.md` for Gemini CLI — and writes its session transcripts to a known
+folder on disk. MemBridge's background daemon connects the two: it watches
+the transcripts, distills a brief per-project memory, and injects it into
+every context file inside a clearly-delimited block:
 
 ```
 Claude Code ─┐                          ┌─> CLAUDE.md   (read by Claude Code)
@@ -25,20 +86,6 @@ any tool ────┘        memory            └─> GEMINI.md…  (configu
                         ⇅
       team sync (opt-in, redacted) — your teammates' MemBridge daemons
 ```
-
-## Why your AI tools forget each other's work
-
-Every AI coding assistant keeps its own siloed session history. Claude Code
-doesn't know what Codex did this morning; your Codex has no idea what your
-teammate's Claude Code shipped an hour ago. So the same context gets
-re-explained, tool after tool, teammate after teammate.
-
-But every major tool already reads a per-project context file at startup —
-`CLAUDE.md` for Claude Code, `AGENTS.md` for Codex and most agents,
-`GEMINI.md` for Gemini CLI — and writes its session transcripts to a known
-folder on disk. MemBridge connects the two: it watches the transcripts,
-distills a brief per-project memory, and injects it into every context file
-inside a clearly-delimited block:
 
 ```markdown
 <!-- membridge:begin -->
@@ -55,59 +102,47 @@ Files recently modified by AI tools: src/login.js
 <!-- membridge:end -->
 ```
 
-The rest of your file is never touched, and `membridge remove` (or the
-**Remove block** button on a project's Memory tab) strips the blocks cleanly.
+The rest of your file is never touched, and the **Remove block** button (or
+`membridge remove`) strips the blocks cleanly.
 
-## The Team hub
+Beyond the brief block, MemBridge keeps a structured memory database inside
+each project at `.membridge/`:
 
-The dashboard's **Team** tab is a real collaboration hub — not just account
-plumbing:
+- **`memory.json`** — every AI update as a structured entry: timestamp,
+  which tool, what was asked, and exactly which files it touched, plus an
+  **index of the project's local files** (ignore-aware, so
+  `node_modules`/`.git` never pollute it) that lets one LLM point another at
+  the precise files a change refers to.
+- **`memory.md`** — the same memory rendered as markdown, readable by humans
+  and by any agent that opens the project.
 
-- **Activity feed** — everything your team's AI tools did, grouped by day:
-  author, tool badge, project, the ask, and the files it touched. Filter by
-  member, project, or tool; "Load more" pages back through history.
-- **Members** — who's on the team, their role, when they were last active.
-  Click through to a **member page**: their projects, their recent work as a
-  timeline. Owners and admins can change roles or remove members; anyone can
-  leave.
-- **Team projects** — every project the team shares, with contributor counts
-  and last activity. Click through to a **project page**: contributors and
-  the project's full activity feed. Projects you also have locally are
-  linked back to their local dashboard page.
-- **Invites** — mint invite links from the hub header, with optional expiry
-  and max-use caps; copy, revoke, done. Joining is one command
-  (`membridge join <link>`) or one click in the web workspace.
-- **Team settings** — rename the team, rotate the legacy invite code, leave.
-- **Multi-team** — a switcher in the hub header if you're on more than one.
+Add `.membridge/` to your project's `.gitignore` if you don't want the
+memory committed — or commit it to share AI context with your whole team.
 
-Prefer a browser? The [`web/`](web/README.md) folder is the hosted team
-workspace (Next.js + Supabase): invite landings at `/join/<token>`, the same
-day-grouped feed with filters, project stats, and member/role/invite
-management — teammates can see who did what without installing anything.
+## Quick start
 
-### Getting your team on it
-
-The backend ships with MemBridge — nothing to install or configure:
-
-```bash
-membridge signup --email you@company.com --password ... --name "Marco"
-
-# one person creates the team and mints an invite link...
-membridge team create acme
-membridge team invite             # optional: --expires-days 7 --max-uses 5
-
-# ...everyone else joins with one command (creates the account if needed)
-membridge join <link-or-token> --email you@co.com --password ...
-
-# inside a project you want to share
-membridge team link               # commit .membridge/team.json for teammates
-```
-
-From then on the daemon syncs linked projects with your team on its normal
-interval. When your clone of a repo a teammate already shares is detected
-(same normalized git remote), MemBridge **suggests** the link in the
-dashboard — nothing is shared until you confirm (or opt into automatic
-linking with `"team": { "autoLink": true }`).
+1. **Install the app** (macOS): download `MemBridge-<version>.dmg` from the
+   [latest release](https://github.com/mmelika/membridge/releases), drag it
+   to Applications, and launch — a bridge icon appears in your menu bar with
+   status, dashboard, pause, and start-at-login. (Builds are unsigned for
+   now: right-click → Open on first launch.) On Windows/Linux, or on a
+   server, use [the CLI](#the-cli) instead.
+2. **Watch your own tools sync.** That's the zero-setup core: the Overview
+   fills with your projects, and Claude Code and Codex start seeing each
+   other's work. No account needed for any of this.
+3. **Create your team** in the Team tab: sign up, create the team, hit
+   **+ Invite**, and share the link (add an expiry or use cap if you like).
+   The backend ships with the app — nothing to install or configure.
+4. **Teammates join** by opening the invite link in the web workspace (one
+   click, works before they've installed anything) — then install the app
+   so their own AI activity flows into the feed. Terminal folks:
+   `membridge join <link>` does signup and join in one command.
+5. **Share a project** from the Team hub ("Share a local project…") — and
+   commit the resulting `.membridge/team.json` so teammates' clones connect
+   too. When MemBridge spots a clone of a repo a teammate already shares
+   (same normalized git remote), it **suggests** the link in the dashboard —
+   nothing is shared until you confirm (or opt into
+   `"team": { "autoLink": true }`).
 
 **What leaves your machine (and only for linked projects):** the same
 redacted digest entries you see in `.membridge/memory.md` — timestamps, tool
@@ -124,7 +159,7 @@ so users configure nothing. To run your own instead:
 
 1. Create a [Supabase](https://supabase.com) project (free tier is plenty),
    open its SQL Editor, and run [`supabase/schema.sql`](supabase/schema.sql)
-   followed by [`supabase/migrations/002_team_v2.sql`](supabase/migrations/002_team_v2.sql)
+   followed by the files in [`supabase/migrations/`](supabase/migrations)
    (invite links, roles, the feed the apps use).
 2. Grab the Project URL and `anon` public key from Settings → API. Both are
    safe to publish — the anon key is meant for client apps, and row-level
@@ -136,40 +171,18 @@ so users configure nothing. To run your own instead:
    ```
 </details>
 
-## Per-project memory database and file index
+## Session summaries (distillation)
 
-Beyond the brief context block, MemBridge keeps a structured memory database
-inside each project at `.membridge/`:
+Harvested summaries (the agent's last chat message) are decent; a summary
+the agent writes *on purpose* is better. The app asks once, on first run,
+whether to turn this on; the Settings → Session summaries card toggles it
+any time (CLI: `membridge setup-hooks` / `remove-hooks`).
 
-- **`memory.json`** — every AI update as a structured entry: timestamp, which
-  tool, what was asked, and exactly which files it touched. It also carries an
-  **index of the project's local files** (relative path, size, modified time —
-  ignore-aware, so `node_modules`/`.git` never pollute it), which lets one LLM
-  point another at the precise files a change refers to.
-- **`memory.md`** — the same memory rendered as markdown, readable by humans
-  and by any agent that opens the project.
-
-The injected context block links to these files, so a tool that wants more
-than the brief summary can follow the reference. Add `.membridge/` to your
-project's `.gitignore` if you don't want the memory committed — or commit it
-to share AI context with your whole team.
-
-## Session distillation (Claude Code hook)
-
-Harvested summaries (the agent's last chat message) are decent; a summary the
-agent writes *on purpose* is better. With one opt-in, the agent that did the
-work distills its own session before it ends — the app asks for consent on
-first run, the Settings → Session summaries card toggles it any time, and the
-CLI equivalent is:
-
-```bash
-membridge setup-hooks
-```
-
-This registers a [Stop hook](https://docs.claude.com/en/docs/claude-code/hooks)
-in `~/.claude/settings.json`. When a Claude Code session that edited files
-tries to stop, the hook blocks the stop once and asks the agent to append one
-JSON line to `<project>/.membridge/summaries.jsonl`:
+Enabled, it registers a
+[Stop hook](https://docs.claude.com/en/docs/claude-code/hooks) in
+`~/.claude/settings.json`. When a Claude Code session that edited files
+tries to stop, the hook blocks the stop once and asks the agent to append
+one JSON line to `<project>/.membridge/summaries.jsonl`:
 
 ```json
 {"session":"<id>","ts":"<ISO time>","did":"What was accomplished.","decisions":"Key choices.","gotchas":"Surprises."}
@@ -177,31 +190,27 @@ JSON line to `<project>/.membridge/summaries.jsonl`:
 
 MemBridge merges these as high-quality `Distilled` summaries that take
 precedence over harvested ones everywhere — the context block, `memory.md`,
-the Copy-for-AI digest, and team sync (redacted like everything else before
-it leaves the machine).
+the Copy-for-AI digest, and the team feed (redacted like everything else
+before it leaves the machine). So the feed your teammates read is written by
+the agent that did the work, on purpose.
 
 **Checkpoints, not one-shot.** A ten-turn session shouldn't be frozen by a
-summary it wrote in turn two. The first checkpoint is asked once a session has
-`distill.minEdits` edits (default 1); after that, the hook re-blocks every
-`distill.checkpointEvery` further edits (default 4) and asks for a fresh line
-covering only the new work — so the summary stays current as the work grows.
-Each line is appended; earlier ones are never edited. The **context block and
-team sync always show the latest checkpoint**, while **`memory.md` keeps the
-full numbered sequence** (and `memory.json` a `checkpoints` array) so anyone
-can read the whole arc of a long session. Both knobs are editable under
-Settings → Session summaries → Advanced, or in config; a `checkpointEvery`
-below 1 falls back to the default.
+summary it wrote in turn two. The first checkpoint is asked once a session
+has `distill.minEdits` edits (default 1); after that, the hook re-blocks
+every `distill.checkpointEvery` further edits (default 4) and asks for a
+fresh line covering only the new work. Each line is appended; earlier ones
+are never edited. The context block and team feed always show the latest
+checkpoint, while `memory.md` keeps the full numbered sequence so anyone can
+read the whole arc of a long session. Both knobs live under Settings →
+Session summaries → Advanced.
 
 **Consent model.** Nothing is installed silently: the daemon never touches
-`~/.claude/settings.json` on its own. The app asks once, on first run; the
-Settings toggle and `membridge setup-hooks` are the only things that install
-the hook, they append without disturbing your existing hooks, and turning the
-toggle off (or `membridge remove-hooks`) strips exactly what was added. The
-hook itself is strictly fail-open — any error, a paused/untracked project, a
-session with fewer than `distill.minEdits` edits, or `distill.enabled: false`
-means Claude Code stops normally, uninterrupted. It never blocks the same
-stop twice. `membridge status` shows whether distillation is on and the hook
-installed.
+`~/.claude/settings.json` on its own — only the first-run prompt, the
+Settings toggle, or `membridge setup-hooks` do, they append without
+disturbing your existing hooks, and turning it off strips exactly what was
+added. The hook itself is strictly fail-open — any error, a paused/untracked
+project, a too-small session, or `distill.enabled: false` means Claude Code
+stops normally, uninterrupted. It never blocks the same stop twice.
 
 **Codex fallback (tiering).** Claude Code is the *enforced* tier — the Stop
 hook guarantees the ask. Tools reading `AGENTS.md` (Codex and friends) have
@@ -209,29 +218,6 @@ no hook, so they get the *requested* tier: the injected block carries a
 standing instruction to append the same summary line on task completion.
 Well-behaved agents comply; nothing breaks when they don't — MemBridge just
 falls back to the harvested summary.
-
-## The dashboard
-
-`membridge dashboard` opens a local web UI (the menu-bar app shows the same
-thing):
-
-- **Overview** — every local project with AI activity: tool badges, last
-  activity, paused state. A **Scan** button shows what MemBridge detected:
-  which adapters are configured, which session folders exist, which projects
-  have activity — read-only, so you can see exactly what it sees.
-- **Project pages** — the full ask-by-ask activity feed with the files each
-  ask touched; a Memory tab showing exactly what gets injected where, with a
-  read-only view of the full memory log, pause/resume, delete, and **Remove
-  block**; and a **Copy for AI** button that puts a trimmed, redacted digest
-  on your clipboard for pasting into ChatGPT, claude.ai, or any web AI that
-  cannot see your disk.
-- **Team** — the Team hub described above.
-- **Neural map** — a force-directed map of every chat across every project,
-  linked by shared files and shared ideas.
-- **Settings** — session summaries (the distillation toggle, hook status, and
-  checkpoint knobs), bring-your-own-key and planner model, sync interval and
-  target files, and a collapsed self-hosted-backend card for operators. No
-  config-file editing required.
 
 ## Roadmaps — the bring-your-own-key upgrade
 
@@ -254,30 +240,34 @@ Settings and each project's **Plan tab** becomes a roadmap generator:
   touched, and top-level folder names. Never file contents, never other
   projects.
 
-## Quick start
+## The CLI
 
-**macOS menu-bar app:** download `MemBridge-<version>.dmg` from the
-[latest release](https://github.com/mmelika/membridge/releases), drag it to
-Applications, and launch — a bridge icon appears in your menu bar with
-status, dashboard, pause, and start-at-login. (Builds are unsigned for now:
-right-click → Open on first launch.)
-
-**CLI daemon** (any OS, Node.js 18+):
+Everything above is also a command — the app and the CLI are the same
+daemon at feature parity, so headless boxes, Linux, and terminal-first
+teammates are first-class:
 
 ```bash
 npm install -g membridge
 
 membridge scan       # read-only: see which AI tools and projects it found
 membridge start      # run the background daemon
-membridge dashboard  # open the local web dashboard
+membridge dashboard  # open the same dashboard in your browser
 ```
 
-Optional: `membridge enable-autostart` launches MemBridge at login
-(Startup folder on Windows, launchd on macOS, systemd user unit on Linux —
-no admin rights needed). The tray app has its own "Start at login" toggle.
-
-Then, when you want the team layer, see
-[Getting your team on it](#getting-your-team-on-it) above.
+| Command | What it does |
+| --- | --- |
+| `membridge start` / `stop` / `status` | Manage the background daemon |
+| `membridge dashboard` | Open the web UI at `http://127.0.0.1:7437` |
+| `membridge sync [--dry-run] [--project <path>]` | One sync pass right now |
+| `membridge scan` | Read-only report of discovered tools and projects |
+| `membridge remove [--project <path>]` | Strip injected memory blocks |
+| `membridge enable-autostart` / `disable-autostart` | Run at login |
+| `membridge setup-hooks` / `remove-hooks` | Session distillation hook (see above) |
+| `membridge signup` / `login` / `logout` | Team account |
+| `membridge join <link-or-code>` | Accept an invite (creates the account if needed) |
+| `membridge team create` / `invite` / `revoke-invite` | Create a team, mint and revoke invite links |
+| `membridge team link` / `unlink` / `list` | Share (or stop sharing) a project with your team |
+| `membridge team setup` | Advanced: point at a self-hosted backend |
 
 ## Supported AI coding tools
 
@@ -288,30 +278,11 @@ Then, when you want the team layer, see
 | Gemini CLI | Custom adapter | Point a config-driven adapter at its logs, add `GEMINI.md` to targets |
 | Cursor, opencode, Copilot CLI, … | Custom adapter | Any tool that logs sessions as JSONL works — no code required |
 
-## Commands
+## Configuration (advanced)
 
-| Command | What it does |
-| --- | --- |
-| `membridge start` / `stop` / `status` | Manage the background daemon |
-| `membridge dashboard` | Open the web UI at `http://127.0.0.1:7437` |
-| `membridge sync [--dry-run] [--project <path>]` | One sync pass right now |
-| `membridge scan` | Read-only report of discovered tools and projects |
-| `membridge remove [--project <path>]` | Strip injected memory blocks |
-| `membridge enable-autostart` / `disable-autostart` | Run at login |
-| `membridge setup-hooks` / `remove-hooks` | Session distillation via the Claude Code Stop hook (see above) |
-| `membridge signup` / `login` / `logout` | Team account |
-| `membridge join <link-or-code>` | Accept an invite (creates the account if needed) |
-| `membridge team create` / `invite` / `revoke-invite` | Create a team, mint and revoke invite links |
-| `membridge team link` / `unlink` / `list` | Share (or stop sharing) a project with your team |
-| `membridge team setup` | Advanced: point at a self-hosted backend |
-
-Everything in this table has a dashboard equivalent — the CLI and the app are
-at feature parity.
-
-## Configuration
-
-`~/.membridge/config.json` (created on first run — the dashboard's Settings
-view edits the common fields for you):
+The Settings view covers the common options. Under the hood it's
+`~/.membridge/config.json` (created on first run), which also holds the
+advanced ones:
 
 ```jsonc
 {
@@ -333,8 +304,8 @@ view edits the common fields for you):
 }
 ```
 
-To pause a single project, drop an empty `.membridge-off` file in its root, or
-click Pause in the dashboard.
+To pause a single project, click Pause in the dashboard — or drop an empty
+`.membridge-off` file in its root.
 
 ### Connect any other AI tool (custom adapters)
 
@@ -402,33 +373,38 @@ automatically.
 
 ## FAQ
 
+**Do I need the terminal?**
+No. Installing the app, creating a team, inviting people, sharing projects,
+and every setting are all in the UI. The CLI exists for Linux/headless
+machines and people who prefer it.
+
 **Do I need an account?**
-Only for team sync. Solo syncing between your own tools works with zero
-accounts, zero keys, and zero network.
+Only for the team layer. Syncing your own tools with each other works with
+zero accounts, zero keys, and zero network.
 
 **Do I need an API key?**
-No. Syncing works without one. An Anthropic API key (added in Settings)
-unlocks exactly one optional feature: per-project roadmaps on the Plan tab,
-billed to your key at roughly a cent per roadmap.
-
-**How do I make Codex aware of what Claude Code did?**
-Install MemBridge and run `membridge start`. It summarizes recent Claude Code
-activity into `AGENTS.md`, which Codex reads automatically — and vice versa
-into `CLAUDE.md`.
+No. An Anthropic API key (added in Settings) unlocks exactly one optional
+feature: per-project roadmaps on the Plan tab, billed to your key at roughly
+a cent per roadmap.
 
 **Does my whole team need the app installed?**
 Everyone whose AI activity should sync runs MemBridge. Teammates who just
 want to *see* what's happening can use the hosted web workspace — the feed,
 projects, and member management work from a browser alone.
 
+**How do I make Codex aware of what Claude Code did?**
+Just run MemBridge. It summarizes recent Claude Code activity into
+`AGENTS.md`, which Codex reads automatically — and vice versa into
+`CLAUDE.md`.
+
 **Does it work with more than two tools?**
 Yes. Adapters are pluggable: Claude Code and Codex are built in, and the
-config-driven custom adapter connects anything that logs JSONL. All tools share
-the same memory.
+config-driven custom adapter connects anything that logs JSONL. All tools
+share the same memory.
 
 **Will it mess up my existing CLAUDE.md / AGENTS.md?**
 No. MemBridge only ever rewrites the content between its `<!-- membridge -->`
-markers. Your own notes are preserved byte-for-byte, and `membridge remove`
+markers. Your own notes are preserved byte-for-byte, and removing the block
 restores files exactly.
 
 **How much overhead does it add?**
