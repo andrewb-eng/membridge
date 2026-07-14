@@ -77,9 +77,8 @@ membridge setup-hooks
 
 This registers a [Stop hook](https://docs.claude.com/en/docs/claude-code/hooks)
 in `~/.claude/settings.json`. When a Claude Code session that edited files
-tries to stop without having written a summary, the hook blocks the stop once
-and asks the agent to append one JSON line to
-`<project>/.membridge/summaries.jsonl`:
+tries to stop, the hook blocks the stop once and asks the agent to append one
+JSON line to `<project>/.membridge/summaries.jsonl`:
 
 ```json
 {"session":"<id>","ts":"<ISO time>","did":"What was accomplished.","decisions":"Key choices.","gotchas":"Surprises."}
@@ -89,6 +88,18 @@ MemBridge merges these as high-quality `Distilled` summaries that take
 precedence over harvested ones everywhere — the context block, `memory.md`,
 the Copy-for-AI digest, and team sync (redacted like everything else before
 it leaves the machine).
+
+**Checkpoints, not one-shot.** A ten-turn session shouldn't be frozen by a
+summary it wrote in turn two. The first checkpoint is asked once a session has
+`distill.minEdits` edits (default 1); after that, the hook re-blocks every
+`distill.checkpointEvery` further edits (default 4) and asks for a fresh line
+covering only the new work — so the summary stays current as the work grows.
+Each line is appended; earlier ones are never edited. The **context block and
+team sync always show the latest checkpoint**, while **`memory.md` keeps the
+full numbered sequence** (and `memory.json` a `checkpoints` array) so anyone
+can read the whole arc of a long session. Set `checkpointEvery` higher for
+fewer interruptions, or lower for finer-grained history; a value below 1 falls
+back to the default.
 
 **Consent model.** Nothing is installed automatically: the daemon never
 touches `~/.claude/settings.json`; only the explicit `membridge setup-hooks`
@@ -274,7 +285,7 @@ no admin rights needed). The tray app has its own "Start at login" toggle.
   "redact": ["sk-[A-Za-z0-9_-]{8,}", "..."],  // scrubbed before injection
   "maxPrompts": 8,
   "maxFiles": 10,
-  "distill": { "enabled": true, "minEdits": 1 }, // Stop-hook session summaries
+  "distill": { "enabled": true, "minEdits": 1, "checkpointEvery": 4 }, // Stop-hook session checkpoints
   "adapters": {
     "claude-code": { "enabled": true },
     "codex": { "enabled": true },
