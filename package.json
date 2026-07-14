@@ -46,10 +46,7 @@
     "mac": {
       "target": ["dmg", "zip"],
       "category": "public.app-category.developer-tools",
-      "icon": "app/assets/icon.png",
-      "extendInfo": {
-        "LSUIElement": true
-      }
+      "icon": "app/assets/icon.png"
     },
     "win": {
       "target": ["zip"]
