@@ -679,6 +679,30 @@ async function main() {
       assert.strictEqual(addBad.status, 400, 'nonexistent path was accepted');
     });
 
+    // Remove block: unlike delete, this only strips the injected block from
+    // context files. History (.membridge + state) stays put, and a plain
+    // sync brings the block right back.
+    const removeRes = await (await post(`${base}/api/projects/remove`, { path: proj1 })).json();
+    check('remove-block strips the block but keeps memory + state', () => {
+      assert.strictEqual(removeRes.removed, true, `remove said: ${JSON.stringify(removeRes)}`);
+      const md = claudeMd();
+      assert.ok(!md.includes(digest.BEGIN), 'block not stripped from CLAUDE.md');
+      assert.ok(md.startsWith('# Shop app'), 'original heading lost');
+      assert.ok(!fs.existsSync(path.join(proj1, 'AGENTS.md')), 'block-only AGENTS.md not deleted');
+      assert.ok(fs.existsSync(path.join(proj1, '.membridge')), '.membridge dir was removed');
+      assert.ok(fs.existsSync(path.join(proj1, '.membridge', 'memory.md')), 'memory log was removed');
+      const state = util.loadState();
+      const key = Object.keys(state.projects).find(k => k.toLowerCase() === proj1.toLowerCase());
+      assert.ok(key && state.projects[key].events.length, 'project state/history was wiped');
+    });
+
+    await post(`${base}/api/sync`, { project: proj1 });
+    check('sync after remove-block re-adds the block', () => {
+      const md = claudeMd();
+      assert.ok(md.includes(digest.BEGIN), 'block not re-added after sync');
+      assert.ok(fs.existsSync(path.join(proj1, 'AGENTS.md')), 'AGENTS.md not recreated after sync');
+    });
+
     const delRes = await (await post(`${base}/api/projects/delete`, { path: proj1 })).json();
     const afterDel = await (await fetch(`${base}/api/projects`)).json();
     check('delete project strips blocks, memory and state', () => {
