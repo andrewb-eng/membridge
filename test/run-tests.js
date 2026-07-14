@@ -29,6 +29,7 @@ const claudeAdapter = require('../lib/adapters/claude-code');
 const codexAdapter = require('../lib/adapters/codex');
 const hooks = require('../lib/hooks');
 const redactLib = require('../lib/redact');
+const feed = require('../lib/feed');
 
 const BIN = path.join(__dirname, '..', 'bin', 'membridge.js');
 const proj1 = path.join(ROOT, 'projects', 'shop-app');
@@ -2272,6 +2273,32 @@ async function main() {
     rc.distill.consent = savedConsent;
     util.saveUserConfig(rc);
   }
+
+  // --- 13. feed read-model (lib/feed.js) ---
+  check('feed.normalizeLocal maps a buildEntries entry to the normalized shape', () => {
+    const e = { ts: '2026-07-14T06:00:00Z', source: 'Claude Code', ask: 'fix the bug',
+      summary: 'Fixed the null deref', distilled: true, files: ['a.js', 'b.js'],
+      tasks: { done: 1, total: 2, items: [] } };
+    const n = feed.normalizeLocal(e, { projectPath: '/Users/x/proj', projectName: 'proj', projectId: 'uuid-1' });
+    assert.strictEqual(n.origin, 'local');
+    assert.strictEqual(n.self, true);
+    assert.strictEqual(n.author, 'You');
+    assert.strictEqual(n.summary, 'Fixed the null deref');
+    assert.strictEqual(n.ask, 'fix the bug');
+    assert.strictEqual(n.distilled, true);
+    assert.strictEqual(n.project, 'proj');
+    assert.strictEqual(n.projectPath, '/Users/x/proj');
+    assert.strictEqual(n.projectId, 'uuid-1');
+    assert.deepStrictEqual(n.files, ['a.js', 'b.js']);
+    assert.strictEqual(n.cursor, null);
+  });
+  check('feed.normalizeLocal treats a missing summary as in-progress (summary=null)', () => {
+    const n = feed.normalizeLocal({ ts: '2026-07-14T06:00:00Z', source: 'Codex', ask: 'do a thing', files: [] },
+      { projectPath: '/p', projectName: 'p', projectId: null });
+    assert.strictEqual(n.summary, null);
+    assert.strictEqual(n.distilled, false);
+    assert.strictEqual(n.projectId, null);
+  });
 
   // --- summary ---
   const failed = results.filter(([, e]) => e);
