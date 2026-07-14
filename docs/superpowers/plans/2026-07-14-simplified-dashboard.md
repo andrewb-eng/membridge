@@ -275,7 +275,7 @@ check('feed.buildFeed passes through the teamUnavailable degradation flag', () =
 // path, which no team row carries, so they never collide.
 function dedupeKey(e) {
   const proj = e.projectId || e.projectPath || e.project || '';
-  return proj + ' ' + (e.ts || '') + ' ' + (e.ask || '');
+  return proj + ' ' + (e.ts || '') + ' ' + (e.ask || '');
 }
 
 function buildFeed(input) {
