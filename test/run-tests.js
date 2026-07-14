@@ -2034,6 +2034,58 @@ async function main() {
     await new Promise(r => mock4.server.close(r));
   }
 
+  // Regression: a real multi-prompt session — two distilled checkpoints
+  // written while DIFFERENT prompts were current. The sequence exists only at
+  // the session level, so it must be collected per session and attached to one
+  // representative entry, never scattered across (or duplicated onto) the
+  // prompts that happened to be current as each line landed.
+  const projMp = path.join(ROOT, 'projects', 'multi-prompt-app');
+  fs.mkdirSync(path.join(projMp, 'src'), { recursive: true });
+  const mpCDir = path.join(process.env.MEMBRIDGE_CLAUDE_DIR, 'slug-multi-prompt-app');
+  fs.mkdirSync(mpCDir, { recursive: true });
+  fs.writeFileSync(path.join(mpCDir, 'mp1.jsonl'), jsonl([
+    { type: 'user', message: { role: 'user', content: 'Build the export pipeline for weekly reports' }, cwd: projMp, timestamp: '2026-07-14T05:00:00.000Z' },
+    { type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', name: 'Edit', input: { file_path: path.join(projMp, 'src', 'export.js') } }] }, cwd: projMp, timestamp: '2026-07-14T05:01:00.000Z' },
+    { type: 'user', message: { role: 'user', content: 'confirm which file holds the cron config' }, cwd: projMp, timestamp: '2026-07-14T05:10:00.000Z' },
+    { type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', name: 'Edit', input: { file_path: path.join(projMp, 'src', 'cron.js') } }] }, cwd: projMp, timestamp: '2026-07-14T05:11:00.000Z' },
+  ]));
+  fs.mkdirSync(path.join(projMp, '.membridge'), { recursive: true });
+  fs.writeFileSync(path.join(projMp, '.membridge', 'summaries.jsonl'),
+    JSON.stringify({ session: 'mp1', ts: '2026-07-14T05:05:00.000Z', did: 'Checkpoint alpha: built the report exporter and wired the weekly scheduler.' }) + '\n' +
+    JSON.stringify({ session: 'mp1', ts: '2026-07-14T05:15:00.000Z', did: 'Checkpoint beta: moved the cron config into its own module and covered it with tests.' }) + '\n');
+  syncOnce();
+
+  check('checkpoint: multi-prompt session — memory.json carries the ordered sequence on one entry', () => {
+    const db = JSON.parse(read(path.join(projMp, '.membridge', 'memory.json')));
+    const withSeq = db.entries.filter(e => Array.isArray(e.checkpoints));
+    assert.strictEqual(withSeq.length, 1, `expected exactly one entry with checkpoints, got ${withSeq.length}`);
+    const entry = withSeq[0];
+    assert.strictEqual(entry.checkpoints.length, 2, `expected 2 checkpoints, got ${entry.checkpoints.length}`);
+    assert.ok(entry.checkpoints[0].includes('Checkpoint alpha'), `first checkpoint was: ${entry.checkpoints[0]}`);
+    assert.ok(entry.checkpoints[1].includes('Checkpoint beta'), `second checkpoint was: ${entry.checkpoints[1]}`);
+    // attached to the session's latest summary-bearing entry (the second prompt)
+    assert.strictEqual(entry.ts, '2026-07-14T05:10:00.000Z', `sequence attached to the wrong entry: ${entry.ts}`);
+    // no checkpoint text duplicated or mis-attributed onto any other entry
+    const others = JSON.stringify(db.entries.filter(e => e !== entry));
+    assert.ok(!others.includes('Checkpoint alpha') && !others.includes('Checkpoint beta'),
+      'checkpoint text leaked onto another entry');
+  });
+  check('checkpoint: multi-prompt session — memory.md renders one Checkpoints block, in order', () => {
+    const mem = read(path.join(projMp, '.membridge', 'memory.md'));
+    assert.strictEqual(count(mem, 'Checkpoints:'), 1, `expected exactly one Checkpoints block, got ${count(mem, 'Checkpoints:')}`);
+    const i1 = mem.indexOf('1. Checkpoint alpha'), i2 = mem.indexOf('2. Checkpoint beta');
+    assert.ok(i1 > -1 && i2 > i1, `numbered checkpoints missing or out of order: ${[i1, i2]}`);
+    assert.strictEqual(count(mem, 'Checkpoint alpha'), 1, 'first checkpoint text duplicated in memory.md');
+    assert.strictEqual(count(mem, 'Checkpoint beta'), 1, 'second checkpoint text duplicated in memory.md');
+    assert.ok(!mem.includes('Result: Checkpoint'), 'a checkpoint also rendered as a Result line');
+  });
+  check('checkpoint: multi-prompt session — injected block shows only the latest checkpoint', () => {
+    const claude = read(path.join(projMp, 'CLAUDE.md'));
+    assert.ok(claude.includes('Result: Checkpoint beta'), 'block missing the latest checkpoint');
+    assert.ok(!claude.includes('Checkpoint alpha'), 'block leaked an earlier checkpoint');
+    assert.strictEqual(count(claude, 'Checkpoint beta'), 1, 'block repeated the checkpoint');
+  });
+
   // --- 12. built-in secret redaction (lib/redact.js) ---
   // Per-pattern unit coverage: the secret is gone and the named marker present.
   const GH_TOKEN = 'ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
