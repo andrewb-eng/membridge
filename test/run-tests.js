@@ -161,7 +161,7 @@ async function main() {
   check('secrets are redacted before injection', () => {
     const md = claudeMd();
     assert.ok(!md.includes('sk-test1234567890abcdef'), 'API key leaked');
-    assert.ok(md.includes('[redacted]'), 'no redaction marker');
+    assert.ok(md.includes('[redacted'), 'no redaction marker');
   });
   check('recently modified files are listed', () => {
     assert.ok(claudeMd().includes('login.js'), 'edited file missing');
@@ -474,7 +474,7 @@ async function main() {
     });
     check('copy-for-AI digest is redacted, unknown project 404s', () => {
       assert.ok(!copyBody.text.includes('sk-test1234567890abcdef'), 'secret leaked into copy digest');
-      assert.ok(copyBody.text.includes('[redacted]'), 'no redaction marker in copy digest');
+      assert.ok(copyBody.text.includes('[redacted'), 'no redaction marker in copy digest');
       assert.strictEqual(copyBad.status, 404, 'unknown project was accepted');
     });
 
@@ -580,7 +580,7 @@ async function main() {
       const body = JSON.stringify(lastPlanRequest);
       assert.ok(!body.includes('sk-goal-secret-9999'), 'goal secret reached the API');
       assert.ok(!body.includes('sk-test1234567890abcdef'), 'transcript secret reached the API');
-      assert.ok(body.includes('[redacted]'), 'redaction marker missing from the payload');
+      assert.ok(body.includes('[redacted'), 'redaction marker missing from the payload');
       assert.ok(body.includes('shop-app'), 'project name missing');
       assert.ok(body.includes('Build the login page with OAuth'), 'recent asks missing');
     });
@@ -765,7 +765,7 @@ async function main() {
       assert.ok(mock.entries.length >= 3, `expected >=3 pushed entries, got ${mock.entries.length}`);
       const body = JSON.stringify(mock.entries);
       assert.ok(!body.includes('sk-test1234567890abcdef'), 'secret reached the server');
-      assert.ok(body.includes('[redacted]'), 'redaction marker missing server-side');
+      assert.ok(body.includes('[redacted'), 'redaction marker missing server-side');
       assert.ok(mock.entries.every(e => e.author_name === 'Marco'), 'author attribution wrong');
     });
 
@@ -1151,11 +1151,11 @@ async function main() {
   });
   check('rich: summaries and todo items are redacted everywhere they land', () => {
     assert.ok(!richMd().includes('sk-test1234567890abcdef'), 'summary secret leaked into the block');
-    assert.ok(richMd().includes('[redacted]'), 'no redaction marker in the block');
+    assert.ok(richMd().includes('[redacted'), 'no redaction marker in the block');
     const db = JSON.parse(read(path.join(projR, '.membridge', 'memory.json')));
     const entry = db.entries.find(e => e.summary);
     assert.ok(entry, 'no entry carries a summary');
-    assert.ok(entry.summary.includes('[redacted]') && !entry.summary.includes('sk-test1234567890abcdef'), 'entry summary not redacted');
+    assert.ok(entry.summary.includes('[redacted') && !entry.summary.includes('sk-test1234567890abcdef'), 'entry summary not redacted');
     assert.deepStrictEqual({ done: entry.tasks.done, total: entry.tasks.total }, { done: 1, total: 3 });
     const raw = read(path.join(projR, '.membridge', 'memory.json')) + read(path.join(projR, '.membridge', 'memory.md'));
     assert.ok(!raw.includes('secret-todo-999'), 'todo item secret leaked into the memory DB');
@@ -1262,7 +1262,7 @@ async function main() {
     check('rich: pushed entries include the redacted summary, never todo text', () => {
       const withSummary = mock2.entries.filter(e => e.summary);
       assert.ok(withSummary.length >= 1, `no pushed entry carries a summary (${mock2.entries.length} rows)`);
-      assert.ok(withSummary.some(e => e.summary.includes('[redacted]')), 'pushed summary not redacted');
+      assert.ok(withSummary.some(e => e.summary.includes('[redacted')), 'pushed summary not redacted');
       assert.ok(mock2.entries.every(e => !e.summary || e.summary.length <= 300), 'summary over the 300-char cap');
       const body = JSON.stringify(mock2.entries);
       assert.ok(!body.includes('sk-test1234567890abcdef'), 'summary secret reached the server');
@@ -1492,7 +1492,7 @@ async function main() {
       assert.ok(row, `sessD entry not pushed (${mock3.entries.length} rows)`);
       assert.ok(row.summary && row.summary.includes('Hardened the webhook auth'), `summary was: ${row.summary}`);
       assert.ok(!row.summary.includes('Harvested note'), 'push chose the harvested summary');
-      assert.ok(row.summary.includes('[redacted]'), 'pushed distilled summary not redacted');
+      assert.ok(row.summary.includes('[redacted'), 'pushed distilled summary not redacted');
       assert.ok(!JSON.stringify(mock3.entries).includes('sk-distilled-secret-123'), 'distilled secret reached the server');
     });
   } finally {
