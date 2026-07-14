@@ -282,7 +282,9 @@ no admin rights needed). The tray app has its own "Start at login" toggle.
   "dashboardPort": 7437,
   "targets": ["CLAUDE.md", "AGENTS.md"], // add "GEMINI.md" etc.
   "exclude": ["C:\\work\\secret-project", "*archive*"],
-  "redact": ["sk-[A-Za-z0-9_-]{8,}", "..."],  // scrubbed before injection
+  "redactDefaults": true,        // built-in secret redaction (see below)
+  "redact": [],                  // your own regexes, replaced with [redacted]
+  "redactExtra": [],             // additive, same syntax as redact
   "maxPrompts": 8,
   "maxFiles": 10,
   "distill": { "enabled": true, "minEdits": 1, "checkpointEvery": 4 }, // Stop-hook session checkpoints
@@ -330,9 +332,28 @@ automatically.
   click Generate, sending only the redacted digest listed above; the key
   lives in `~/.membridge/config.json`, chmod 600, never in any project
   folder, and is never shown back to the dashboard page). No telemetry.
-- **Secrets are redacted** before anything is written into a context file:
-  common API-key shapes (`sk-…`, `AKIA…`, `ghp_…`, `key=value`) are scrubbed
-  by default, and you can add your own patterns.
+- **Secrets are redacted by default**, everywhere text leaves a transcript —
+  the injected `CLAUDE.md`/`AGENTS.md` block, `.membridge/memory.md` and
+  `memory.json`, the Copy-for-AI digest, the roadmap prompt, and team-sync
+  pushes all flow through one redaction pipeline before anything is written or
+  sent. Covered out of the box (`redactDefaults`, on unless set to `false`):
+  AWS / GitHub / Google / Slack / Anthropic / OpenAI key formats, JWTs, PEM
+  private-key blocks, credentials embedded in `postgres://…@` connection URIs,
+  `Authorization`/`Bearer` header values, and generic `password=`/`api_key:`
+  assignments (the value is redacted, the key name kept). A **Shannon-entropy
+  backstop** also catches standalone high-entropy blobs (24+ chars) that match
+  no known shape — while deliberately leaving file paths, URLs, git SHAs,
+  UUIDs (your session ids), and repeated identifiers alone. Each match becomes
+  a named `[redacted:<name>]` marker so you can see *what* was scrubbed.
+  - Add your own patterns with `redact` / `redactExtra` (matched case-insensitively,
+    replaced with a bare `[redacted]`); both are additive to the defaults.
+  - Set `redactDefaults: false` to turn the built-in layer off entirely (then
+    only your `redact`/`redactExtra` patterns apply).
+  - **This is a backstop, not a guarantee.** Regex-and-entropy redaction cannot
+    recognize every secret shape — a novel token format or a secret split across
+    words can slip through. Treat it as defense in depth on top of the real
+    rule: don't paste live credentials into your AI sessions, and use `exclude`
+    or a `.membridge-off` file for projects that handle sensitive material.
 - **Transcripts are read-only** (incrementally, by byte offset). The only files
   MemBridge writes are the configured context files — inside its own markers —
   plus its own state in `~/.membridge`.
