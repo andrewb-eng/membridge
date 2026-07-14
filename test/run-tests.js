@@ -399,6 +399,14 @@ async function main() {
     check('dashboard page serves 200 html', () => {
       assert.strictEqual(page.status, 200);
     });
+    const embeddedScript = (pageHtml.match(/<script>\n([\s\S]*)\n<\/script>/) || [])[1] || '';
+    const scriptCheckPath = path.join(ROOT, 'dashboard-script.js');
+    fs.writeFileSync(scriptCheckPath, embeddedScript);
+    const scriptCheck = spawnSync(process.execPath, ['--check', scriptCheckPath], { encoding: 'utf8' });
+    check('dashboard embedded script parses', () => {
+      assert.ok(embeddedScript, 'embedded dashboard script missing');
+      assert.strictEqual(scriptCheck.status, 0, scriptCheck.stderr || scriptCheck.stdout);
+    });
     check('dashboard page has Overview and Neural map tabs', () => {
       assert.ok(pageHtml.includes('Overview'), 'Overview tab missing');
       assert.ok(pageHtml.includes('Neural map'), 'Neural map tab missing');
