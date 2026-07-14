@@ -1205,6 +1205,21 @@ async function main() {
       assert.ok(teamEntry, 'at least one team entry carries a non-null summary');
       assert.ok(/receipt PDF/.test(teamEntry.summary), `summary text lost: ${teamEntry && teamEntry.summary}`);
     });
+
+    // Regression (Critical): the project page filters /api/feed by a local
+    // filesystem path (`?project=/abs/path`), but team_feed's p_project is a
+    // uuid. feedPayload must resolve a LINKED local path -> its team-project
+    // uuid before querying, or every teammate row for the project silently
+    // vanishes. proj1 is linked to linkA.projectId (shop-app); the mock's
+    // team_feed filters rows by p_project, so a path that isn't resolved
+    // matches nothing.
+    const feedByPath = await (await fetch(
+      `${hubBase}/api/feed?project=${encodeURIComponent(proj1)}&limit=50`)).json();
+    check('/api/feed resolves a linked local path to the team uuid so teammate rows survive', () => {
+      assert.strictEqual(feedByPath.teamUnavailable, false, 'team query must not be flagged unavailable');
+      const teamRow = feedByPath.entries.find(e => e.origin === 'team');
+      assert.ok(teamRow, 'no team-origin row for the linked project — path was not resolved to its uuid');
+    });
     await new Promise(r => hubSrv.close(r));
 
     // Management runs on a fresh team so rotate/remove cannot disturb the
