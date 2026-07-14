@@ -54,10 +54,10 @@ WCAG AA for text.
 
 ## Canvas (neural graph)
 
-The graph draws with JS color literals. It will read its palette from
-`getComputedStyle(document.documentElement)` at draw-setup so it follows the
-active theme; source-identity colors (claude/codex hues) stay fixed but are
-checked for legibility on both backgrounds.
+Implementation deviation: the neural view turned out to be deliberately fixed
+dark navy (`#view-neural` radial gradient) in both themes, so the canvas
+already matches its background everywhere. The graph keeps its JS color
+literals and the view keeps its fixed dark look; no `--graph-*` tokens ship.
 
 ## Cleanup included
 
