@@ -19,7 +19,7 @@ delete process.env.ANTHROPIC_API_KEY; // a real key on the dev machine must not 
 const util = require('../lib/util');
 const { syncOnce } = require('../lib/scan');
 const digest = require('../lib/digest');
-const { startServer, teamPayload, teamProjectsPayload, statusPayload, feedPayload } = require('../lib/server');
+const { startServer, teamPayload, teamProjectsPayload, statusPayload, feedPayload, projectDetail } = require('../lib/server');
 const teamsync = require('../lib/teamsync');
 const { createMockSupabase } = require('./mock-supabase');
 const advisorLib = require('../lib/advisor');
@@ -198,6 +198,34 @@ async function main() {
     assert.strictEqual(stats.sessionsThisWeek, 2, `sessions ${stats.sessionsThisWeek}`); // s1, s2 in window; s3 excluded
     assert.strictEqual(stats.filesTouched, 3, `files ${stats.filesTouched}`); // login, api, old (scratch dropped)
     assert.strictEqual(stats.openTodos, 3, `open ${stats.openTodos}`); // s1 latest snapshot = 2 open, s2 = 1 open
+  });
+  check('relativeLabel: coarse buckets with injectable now', () => {
+    const now = Date.parse('2026-07-14T12:00:00.000Z');
+    const iso = d => new Date(now - d * 86400000).toISOString();
+    assert.strictEqual(digest.relativeLabel(iso(0), now), 'today');
+    assert.strictEqual(digest.relativeLabel(iso(1), now), 'yesterday');
+    assert.strictEqual(digest.relativeLabel(iso(3), now), '3 days ago');
+    assert.strictEqual(digest.relativeLabel(null, now), 'no activity yet');
+  });
+  check('projectDetail: a teammate touch drives team-aware lastTouched + activeLabel + stats', () => {
+    const state = util.loadState();
+    const key = Object.keys(state.projects).find(k => path.basename(k) === 'shop-app');
+    const proj = state.projects[key];
+    const localLast = proj.events[proj.events.length - 1].ts;
+    const saved = proj.teamEntries;
+    const future = '2999-01-01T00:00:00.000Z';
+    proj.teamEntries = [{ author: 'Andrew', ts: future, source: 'Codex', ask: 'teammate touch', files: [] }];
+    util.saveState(state);
+    const det = projectDetail(proj1);
+    assert.strictEqual(det.lastTouched, future, `lastTouched ${det.lastTouched} (localLast ${localLast})`);
+    assert.strictEqual(det.lastActivity, localLast, 'lastActivity should stay local-only');
+    assert.ok(det.stats && typeof det.stats.filesTouched === 'number', 'stats row missing');
+    assert.strictEqual(typeof det.activeLabel, 'string', 'activeLabel missing');
+    assert.ok(det.activeLabel.length > 0, 'activeLabel empty');
+    // restore original state for downstream tests
+    const st2 = util.loadState();
+    st2.projects[key].teamEntries = saved;
+    util.saveState(st2);
   });
   check('file index covers project files and skips ignored dirs', () => {
     const db = JSON.parse(read(path.join(proj1, '.membridge', 'memory.json')));
