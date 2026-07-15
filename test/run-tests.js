@@ -430,6 +430,11 @@ async function main() {
       assert.ok(feedBefore.entries.filter(e => e.origin === 'local').every(e => String(e.ts) <= beforeTs),
         'all local entries respect the before boundary');
     });
+    check('loadState seeds a default catchup read-state', () => {
+      const st = util.loadState();
+      assert.deepStrictEqual(st.catchup, { lastViewedTs: null, prevViewedTs: null, briefing: null },
+        `catchup default missing: ${JSON.stringify(st.catchup)}`);
+    });
     const projects = await (await fetch(`${base}/api/projects`)).json();
     check('dashboard /api/projects lists the project with prompts', () => {
       const p = projects.find(x => x.path.toLowerCase() === proj1.toLowerCase());
