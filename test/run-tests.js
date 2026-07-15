@@ -483,7 +483,6 @@ async function main() {
       assert.ok(pageHtml.includes('body[data-theme="dark"]'), 'dark theme token block missing');
       assert.ok(pageHtml.includes('prefers-color-scheme: dark'), 'system theme fallback missing');
       assert.ok(pageHtml.includes("localStorage.getItem('mb-theme')"), 'theme boot script missing');
-      assert.ok(pageHtml.includes('name="stTheme"'), 'appearance control missing');
     });
     check('dashboard page has the Copy for AI button', () => {
       assert.ok(pageHtml.includes('Copy for AI'), 'Copy for AI button missing');
@@ -493,12 +492,11 @@ async function main() {
     });
     check('dashboard page has the Settings screen with BYOK', () => {
       assert.ok(pageHtml.includes('view-settings'), 'settings view missing');
-      assert.ok(pageHtml.includes('Syncing'), 'sync section missing');
-      assert.ok(pageHtml.includes('Anthropic API key'), 'key section missing');
-      assert.ok(pageHtml.includes('Planner model'), 'model section missing');
-      assert.ok(pageHtml.includes('Advanced: self-hosted backend'), 'self-hosted backend card missing');
-      assert.ok(pageHtml.includes('stTeamUrl'), 'self-hosted backend URL field missing');
-      assert.ok(pageHtml.includes('stTeamAnonKey'), 'self-hosted backend anon key field missing');
+      assert.ok(pageHtml.includes('id="settingsRoot"'), 'settings host missing');
+      assert.ok(pageHtml.includes('Watched projects'), 'watched projects section missing');
+      assert.ok(pageHtml.includes('AI briefings &amp; roadmaps'), 'BYOK section missing');
+      assert.ok(pageHtml.includes('Bring your own key'), 'BYOK copy missing');
+      assert.ok(pageHtml.includes('Tools detected: '), 'tools-detected line missing');
     });
     const feedRes = await (await fetch(`${base}/api/feed?limit=50`)).json();
     check('/api/feed returns a merged entries array with a degradation flag', () => {
