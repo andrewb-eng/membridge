@@ -47,7 +47,7 @@ create table if not exists public.memory_entries (
   author_name text not null,
   ts timestamptz not null,
   source text not null,
-  ask text not null check (char_length(ask) <= 400),
+  ask text check (char_length(ask) <= 400),
   files jsonb not null default '[]'::jsonb,
   session text,
   created_at timestamptz not null default now(),
