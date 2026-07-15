@@ -33,6 +33,13 @@ create table if not exists public.projects (
   unique (team_id, name)
 );
 
+-- Soft-delete for shared projects (see migrations/005_project_archive.sql).
+-- Added via `alter ... add column if not exists` so it is backwards-compatible
+-- with already-live backends and pre-existing clients.
+alter table public.projects add column if not exists archived_at timestamptz;
+alter table public.projects
+  add column if not exists archived_by uuid references auth.users (id);
+
 create table if not exists public.memory_entries (
   id bigint generated always as identity primary key,
   project_id uuid not null references public.projects (id) on delete cascade,

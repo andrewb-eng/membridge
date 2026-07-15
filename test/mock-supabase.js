@@ -161,6 +161,7 @@ function createMockSupabase() {
       let rows = entries
         .map(e => ({ ...e, project_name: (projects.find(p => p.id === e.project_id) || {}).name }))
         .filter(e => projectTeam(e.project_id) === body.p_team)
+        .filter(e => !(projects.find(p => p.id === e.project_id) || {}).archivedAt)
         .filter(e => !body.p_author || e.author_id === body.p_author)
         .filter(e => !body.p_project || e.project_id === body.p_project)
         .filter(e => !body.p_source || e.source === body.p_source)
@@ -172,6 +173,20 @@ function createMockSupabase() {
           (e.created_at === body.p_before_created_at && e.id < body.p_before_id));
       }
       return json(res, 200, rows.slice(0, Math.min(Math.max(body.p_limit || 50, 1), 200)));
+    }
+    if (fn === 'archive_project') {
+      const teamId = projectTeam(body.p_project);
+      if (!isManager(teamId, userId)) return json(res, 403, { message: 'only a team owner or admin can delete a project for the team' });
+      const p = projects.find(x => x.id === body.p_project);
+      if (p) p.archivedAt = new Date().toISOString();
+      return json(res, 200, null);
+    }
+    if (fn === 'unarchive_project') {
+      const teamId = projectTeam(body.p_project);
+      if (!isManager(teamId, userId)) return json(res, 403, { message: 'only a team owner or admin can restore a project' });
+      const p = projects.find(x => x.id === body.p_project);
+      if (p) p.archivedAt = null;
+      return json(res, 200, null);
     }
     json(res, 404, { message: `unknown rpc ${fn}` });
   }
@@ -254,7 +269,7 @@ function createMockSupabase() {
         if (!userId) return json(res, 401, { message: 'not authenticated' });
         const teamEq = (url.searchParams.get('team_id') || '').replace(/^eq\./, '');
         const rows = projects
-          .filter(p => (!teamEq || p.teamId === teamEq) && isMember(p.teamId, userId))
+          .filter(p => (!teamEq || p.teamId === teamEq) && isMember(p.teamId, userId) && !p.archivedAt)
           .map(p => {
             const es = entries.filter(e => e.project_id === p.id);
             return {

@@ -1465,6 +1465,52 @@ async function main() {
       assert.strictEqual(link.projectId, apiLink.projectId);
     });
 
+    // ----- migration 005: project soft-delete (owner/manager, reversible) -----
+    // A fresh linked project so archiving never disturbs the shop-app fixtures.
+    process.env.MEMBRIDGE_HOME = HOME_A;
+    const projArch = path.join(ROOT, 'projects', 'archive-app');
+    fs.mkdirSync(projArch, { recursive: true });
+    fs.writeFileSync(path.join(projArch, 'CLAUDE.md'), '# Archive app\n');
+    const stArch = util.loadState();
+    stArch.projects[projArch] = {
+      events: [{ ts: '2026-07-13T09:00:00.000Z', source: 'Codex', kind: 'prompt', text: 'Draft the archive feature', session: 'arch1' }],
+    };
+    util.saveState(stArch);
+    const archLink = await teamsync.linkProject(util.getConfig(), projArch, team.team_id, 'Acme');
+    await teamsync.syncTeams({ project: projArch }); // push the entry so it appears in the feed
+
+    // A plain member (Dana, home-d) cannot archive: the RPC is manager-gated.
+    process.env.MEMBRIDGE_HOME = path.join(ROOT, 'home-d');
+    let memberArchErr = null;
+    try {
+      await teamsync.archiveProject(util.getConfig(), archLink.projectId);
+    } catch (err) {
+      memberArchErr = err;
+    }
+    check('archive: a plain member cannot delete a shared project for the team', () => {
+      assert.ok(memberArchErr && /owner or admin/i.test(memberArchErr.message), `said: ${memberArchErr && memberArchErr.message}`);
+      assert.ok(!mock.projects.find(p => p.id === archLink.projectId).archivedAt, 'project was archived by a non-manager');
+    });
+
+    // The owner archives it: gone from the projects payload and the feed.
+    process.env.MEMBRIDGE_HOME = HOME_A;
+    await teamsync.archiveProject(util.getConfig(), archLink.projectId);
+    const projsAfterArchive = await teamProjectsPayload(team.team_id);
+    const feedAfterArchive = await teamsync.teamFeed(util.getConfig(), team.team_id, { limit: 100 });
+    check('archive: owner archive hides the project from the projects payload and the feed', () => {
+      assert.ok(mock.projects.find(p => p.id === archLink.projectId).archivedAt, 'archived_at not set');
+      assert.ok(!projsAfterArchive.some(r => r.project_id === archLink.projectId), 'archived project still listed');
+      assert.ok(!feedAfterArchive.some(e => e.project_id === archLink.projectId), 'archived project rows still in the feed');
+    });
+
+    // Reversible: unarchive brings it back.
+    await teamsync.unarchiveProject(util.getConfig(), archLink.projectId);
+    const projsAfterRestore = await teamProjectsPayload(team.team_id);
+    check('archive: unarchive restores the project (reversible)', () => {
+      assert.ok(!mock.projects.find(p => p.id === archLink.projectId).archivedAt, 'archived_at not cleared');
+      assert.ok(projsAfterRestore.some(r => r.project_id === archLink.projectId), 'restored project missing from payload');
+    });
+
     // Privacy: entries never carry a foreign path — not even its basename.
     check('privacy: files outside the project are dropped from entries', () => {
       const ents = memorydb.buildEntries(proj1, {
