@@ -19,7 +19,7 @@ delete process.env.ANTHROPIC_API_KEY; // a real key on the dev machine must not 
 const util = require('../lib/util');
 const { syncOnce } = require('../lib/scan');
 const digest = require('../lib/digest');
-const { startServer, teamPayload, teamProjectsPayload } = require('../lib/server');
+const { startServer, teamPayload, teamProjectsPayload, statusPayload, feedPayload, projectDetail, planPayload } = require('../lib/server');
 const teamsync = require('../lib/teamsync');
 const { createMockSupabase } = require('./mock-supabase');
 const advisorLib = require('../lib/advisor');
@@ -181,6 +181,74 @@ async function main() {
     assert.strictEqual(withFile.ts, '2026-07-09T10:01:00.000Z', 'edit attached to wrong ask');
     const banned = db.entries.find(e => e.ask.includes('sk-test1234567890abcdef'));
     assert.ok(!banned, 'secret leaked into memory DB');
+  });
+  check('projectStats: week-windowed sessions, distinct files, deduped open todos', () => {
+    const now = Date.parse('2026-07-14T12:00:00.000Z');
+    const iso = d => new Date(now - d * 86400000).toISOString();
+    const proj = { events: [
+      { kind: 'prompt', source: 'Claude Code', session: 's1', ts: iso(1), text: 'a' },
+      { kind: 'edit', source: 'Claude Code', session: 's1', ts: iso(1), file: path.join(proj1, 'src/login.js') },
+      { kind: 'edit', source: 'Claude Code', session: 's1', ts: iso(1), file: path.join(proj1, 'src/login.js') }, // dup file
+      { kind: 'edit', source: 'Claude Code', session: 's1', ts: iso(1), file: path.join(proj1, 'src/api.js') },
+      { kind: 'edit', source: 'Claude Code', session: 's1', ts: iso(1), file: path.join(ROOT, 'scratch.js') }, // outside project -> dropped
+      { kind: 'todos', session: 's1', ts: iso(1), items: [ { text: 'x', status: 'completed' }, { text: 'y', status: 'pending' } ] },
+      { kind: 'todos', session: 's1', ts: iso(0.5), items: [ { text: 'x', status: 'completed' }, { text: 'y', status: 'in_progress' }, { text: 'z', status: 'pending' } ] }, // later snapshot -> 2 open
+      { kind: 'prompt', source: 'Codex', session: 's2', ts: iso(2), text: 'b' },
+      { kind: 'todos', session: 's2', ts: iso(2), items: [ { text: 'q', status: 'pending' } ] }, // 1 open
+      { kind: 'prompt', source: 'Claude Code', session: 's3', ts: iso(10), text: 'old' }, // outside 7d window
+      { kind: 'edit', source: 'Claude Code', session: 's3', ts: iso(10), file: path.join(proj1, 'src/old.js') }, // still counts (files are all-time)
+    ] };
+    const stats = memorydb.projectStats(proj1, proj, now);
+    assert.strictEqual(stats.sessionsThisWeek, 2, `sessions ${stats.sessionsThisWeek}`); // s1, s2 in window; s3 excluded
+    assert.strictEqual(stats.filesTouched, 3, `files ${stats.filesTouched}`); // login, api, old (scratch dropped)
+    assert.strictEqual(stats.openTodos, 3, `open ${stats.openTodos}`); // s1 latest snapshot = 2 open, s2 = 1 open
+  });
+  check('relativeLabel: coarse buckets with injectable now', () => {
+    const now = Date.parse('2026-07-14T12:00:00.000Z');
+    const iso = d => new Date(now - d * 86400000).toISOString();
+    assert.strictEqual(digest.relativeLabel(iso(0), now), 'today');
+    assert.strictEqual(digest.relativeLabel(iso(1), now), 'yesterday');
+    assert.strictEqual(digest.relativeLabel(iso(3), now), '3 days ago');
+    assert.strictEqual(digest.relativeLabel(null, now), 'no activity yet');
+  });
+  check('projectDetail: a teammate touch drives team-aware lastTouched + activeLabel + stats', () => {
+    const state = util.loadState();
+    const key = Object.keys(state.projects).find(k => path.basename(k) === 'shop-app');
+    const proj = state.projects[key];
+    const localLast = proj.events[proj.events.length - 1].ts;
+    const saved = proj.teamEntries;
+    const future = '2999-01-01T00:00:00.000Z';
+    proj.teamEntries = [{ author: 'Andrew', ts: future, source: 'Codex', ask: 'teammate touch', files: [] }];
+    util.saveState(state);
+    const det = projectDetail(proj1);
+    assert.strictEqual(det.lastTouched, future, `lastTouched ${det.lastTouched} (localLast ${localLast})`);
+    assert.strictEqual(det.lastActivity, localLast, 'lastActivity should stay local-only');
+    assert.ok(det.stats && typeof det.stats.filesTouched === 'number', 'stats row missing');
+    assert.strictEqual(typeof det.activeLabel, 'string', 'activeLabel missing');
+    assert.ok(det.activeLabel.length > 0, 'activeLabel empty');
+    // restore original state for downstream tests
+    const st2 = util.loadState();
+    st2.projects[key].teamEntries = saved;
+    util.saveState(st2);
+  });
+  check('planPayload: recentAsks merges + dedupes teammate teamEntries, sorted, capped at 20', () => {
+    const config = util.getConfig();
+    const proj = {
+      events: [{ kind: 'prompt', source: 'Claude Code', session: 's1', ts: '2026-07-10T09:00:00.000Z', text: 'Local ask one' }],
+      teamEntries: [
+        { author: 'Andrew', ts: '2026-07-11T09:00:00.000Z', source: 'Codex', ask: 'Teammate refactor', files: ['src/api.js'] },
+        { author: 'Andrew', ts: '2026-07-11T09:00:00.000Z', source: 'Codex', ask: 'Teammate refactor', files: ['src/api.js'] }, // exact dup
+      ],
+    };
+    const payload = planPayload(proj1, proj, config, 'ship it');
+    const asks = payload.recentAsks.map(e => e.ask);
+    assert.ok(asks.includes('Local ask one'), 'local ask dropped');
+    assert.ok(asks.includes('Teammate refactor'), 'teammate ask not folded in');
+    assert.strictEqual(asks.filter(a => a === 'Teammate refactor').length, 1, 'teammate ask not deduped');
+    assert.ok(payload.recentAsks.length <= 20, 'not capped at 20');
+    const iLocal = payload.recentAsks.findIndex(e => e.ask === 'Local ask one');
+    const iTeam = payload.recentAsks.findIndex(e => e.ask === 'Teammate refactor');
+    assert.ok(iLocal !== -1 && iTeam !== -1 && iLocal < iTeam, 'recentAsks not sorted oldest-first by ts');
   });
   check('file index covers project files and skips ignored dirs', () => {
     const db = JSON.parse(read(path.join(proj1, '.membridge', 'memory.json')));
@@ -374,6 +442,7 @@ async function main() {
     questions: ['Should guest checkout ship in v1?'],
   };
   let lastPlanRequest = null;
+  let lastBriefingRequest = null;
   const mockApi = http.createServer((req, res) => {
     const chunks = [];
     req.on('data', c => chunks.push(c));
@@ -388,14 +457,28 @@ async function main() {
           res.end(AUTH_FAIL);
           return;
         }
-        lastPlanRequest = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
-          model: lastPlanRequest.model,
-          stop_reason: 'end_turn',
-          content: [{ type: 'text', text: JSON.stringify(CANNED_PLAN) }],
-          usage: { input_tokens: 4200, output_tokens: 900 },
-        }));
+        const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        if (parsed.output_config) {
+          // Roadmap request: structured JSON plan.
+          lastPlanRequest = parsed;
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            model: parsed.model,
+            stop_reason: 'end_turn',
+            content: [{ type: 'text', text: JSON.stringify(CANNED_PLAN) }],
+            usage: { input_tokens: 4200, output_tokens: 900 },
+          }));
+        } else {
+          // Briefing request: free-form prose.
+          lastBriefingRequest = parsed;
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            model: parsed.model,
+            stop_reason: 'end_turn',
+            content: [{ type: 'text', text: 'Andrew wired the receipt PDF; Dana added refund guardrails.' }],
+            usage: { input_tokens: 500, output_tokens: 60 },
+          }));
+        }
       } else {
         res.writeHead(404);
         res.end();
@@ -465,10 +548,9 @@ async function main() {
       assert.ok(!pageHtml.includes('#team-project='), 'dead team-project route still present');
     });
     check('dashboard page has a persisted three-way theme', () => {
-      assert.ok(pageHtml.includes('color-scheme: light dark'), 'color-scheme missing');
-      assert.ok(pageHtml.includes('light-dark('), 'light-dark() colors missing');
+      assert.ok(pageHtml.includes('body[data-theme="dark"]'), 'dark theme token block missing');
+      assert.ok(pageHtml.includes('prefers-color-scheme: dark'), 'system theme fallback missing');
       assert.ok(pageHtml.includes("localStorage.getItem('mb-theme')"), 'theme boot script missing');
-      assert.ok(pageHtml.includes('name="stTheme"'), 'appearance control missing');
     });
     check('dashboard page has the Copy for AI button', () => {
       assert.ok(pageHtml.includes('Copy for AI'), 'Copy for AI button missing');
@@ -478,12 +560,11 @@ async function main() {
     });
     check('dashboard page has the Settings screen with BYOK', () => {
       assert.ok(pageHtml.includes('view-settings'), 'settings view missing');
-      assert.ok(pageHtml.includes('Syncing'), 'sync section missing');
-      assert.ok(pageHtml.includes('Anthropic API key'), 'key section missing');
-      assert.ok(pageHtml.includes('Planner model'), 'model section missing');
-      assert.ok(pageHtml.includes('Advanced: self-hosted backend'), 'self-hosted backend card missing');
-      assert.ok(pageHtml.includes('stTeamUrl'), 'self-hosted backend URL field missing');
-      assert.ok(pageHtml.includes('stTeamAnonKey'), 'self-hosted backend anon key field missing');
+      assert.ok(pageHtml.includes('id="settingsRoot"'), 'settings host missing');
+      assert.ok(pageHtml.includes('Watched projects'), 'watched projects section missing');
+      assert.ok(pageHtml.includes('AI briefings &amp; roadmaps'), 'BYOK section missing');
+      assert.ok(pageHtml.includes('Bring your own key'), 'BYOK copy missing');
+      assert.ok(pageHtml.includes('Tools detected: '), 'tools-detected line missing');
     });
     const feedRes = await (await fetch(`${base}/api/feed?limit=50`)).json();
     check('/api/feed returns a merged entries array with a degradation flag', () => {
@@ -498,6 +579,61 @@ async function main() {
       assert.ok(feedBefore.entries.filter(e => e.origin === 'local').every(e => String(e.ts) <= beforeTs),
         'all local entries respect the before boundary');
     });
+    check('loadState seeds a default catchup read-state', () => {
+      const st = util.loadState();
+      assert.deepStrictEqual(st.catchup, { lastViewedTs: null, prevViewedTs: null, briefing: null },
+        `catchup default missing: ${JSON.stringify(st.catchup)}`);
+    });
+    // Derive the window from the feed's own timestamps so the test does not
+    // depend on which fixtures have been written by this point in the suite.
+    const feedAllLocal = await (await fetch(`${base}/api/feed?limit=50`)).json();
+    const localAll = feedAllLocal.entries.filter(e => e.origin === 'local');
+    const distinctTs = [...new Set(localAll.map(e => String(e.ts)))].sort();
+    const sinceTs = distinctTs[1]; // second-oldest: guarantees the oldest entry is excluded
+    const feedSince = await (await fetch(`${base}/api/feed?since=${encodeURIComponent(sinceTs)}&limit=50`)).json();
+    check('/api/feed since= keeps only local entries at or after the window', () => {
+      assert.ok(distinctTs.length >= 2, 'fixture needs >=2 distinct local timestamps to exercise the window');
+      const localRows = feedSince.entries.filter(e => e.origin === 'local');
+      assert.ok(localRows.length >= 1, 'expected at least one entry inside the window');
+      assert.ok(localRows.every(e => String(e.ts) >= sinceTs), 'a local entry older than since= leaked through');
+      assert.ok(localRows.length < localAll.length, 'since= did not exclude the older entries');
+    });
+    const feedSinceFuture = await (await fetch(`${base}/api/feed?since=2099-01-01T00:00:00.000Z&limit=50`)).json();
+    check('/api/feed since= in the future drops all local entries', () => {
+      assert.strictEqual(feedSinceFuture.entries.filter(e => e.origin === 'local').length, 0,
+        'future since window must exclude every local row');
+    });
+
+    // Catch-Up read pointer: GET is pure; mark/undo rewrite it. Run sequentially
+    // so the pointer transitions are deterministic (mark sets prev=old-last).
+    const cu0 = await (await fetch(`${base}/api/catchup`)).json();
+    check('GET /api/catchup returns the empty read pointer', () => {
+      assert.strictEqual(cu0.lastViewedTs, null, 'lastViewedTs should start null');
+      assert.strictEqual(cu0.prevViewedTs, null, 'prevViewedTs should start null');
+      assert.strictEqual(cu0.hasBriefing, false, 'no briefing yet');
+    });
+    const markTs = '2026-07-10T00:00:00.000Z';
+    const cu1 = await (await post(`${base}/api/catchup/mark`, { ts: markTs })).json();
+    check('POST /api/catchup/mark with a ts sets lastViewedTs and clears prev from null', () => {
+      assert.strictEqual(cu1.lastViewedTs, markTs, 'lastViewedTs not set to the given ts');
+      assert.strictEqual(cu1.prevViewedTs, null, 'prevViewedTs should be the old (null) lastViewedTs');
+    });
+    const cu2 = await (await post(`${base}/api/catchup/mark`, {})).json();
+    check('POST /api/catchup/mark without a ts stamps now() and shifts prev', () => {
+      assert.strictEqual(cu2.prevViewedTs, markTs, 'prevViewedTs must capture the previous lastViewedTs');
+      assert.ok(cu2.lastViewedTs && !isNaN(Date.parse(cu2.lastViewedTs)), 'lastViewedTs must be a valid ISO now()');
+      assert.ok(cu2.lastViewedTs > markTs, 'now() must sort after the earlier marked ts');
+    });
+    const cuGet = await (await fetch(`${base}/api/catchup`)).json();
+    check('GET /api/catchup reflects the latest mark', () => {
+      assert.strictEqual(cuGet.lastViewedTs, cu2.lastViewedTs, 'read pointer did not persist');
+    });
+    const cu3 = await (await post(`${base}/api/catchup/undo`, {})).json();
+    check('POST /api/catchup/undo restores the previous pointer', () => {
+      assert.strictEqual(cu3.lastViewedTs, markTs, 'undo must restore lastViewedTs to prevViewedTs');
+      assert.strictEqual(cu3.prevViewedTs, null, 'undo must clear prevViewedTs');
+    });
+
     const projects = await (await fetch(`${base}/api/projects`)).json();
     check('dashboard /api/projects lists the project with prompts', () => {
       const p = projects.find(x => x.path.toLowerCase() === proj1.toLowerCase());
@@ -860,6 +996,28 @@ async function main() {
       assert.ok(p, 'deleted project did not reappear');
       assert.ok(p.prompts.some(e => e.text.includes('Ship the checkout flow')), 'new prompt missing');
     });
+
+    process.env.MEMBRIDGE_API_BASE = 'http://127.0.0.1:17944'; // in-process advisor -> the same mock
+    const briefNoKey = await advisorLib.generateBriefing('', 'claude-sonnet-5', { since: null, teammates: [] });
+    const briefOk = await advisorLib.generateBriefing(GOOD_KEY, 'claude-sonnet-5', {
+      since: '2026-07-10T00:00:00.000Z', until: '2026-07-14T00:00:00.000Z',
+      teammates: [
+        { name: 'Andrew', entries: [{ ts: '2026-07-11T09:00:00.000Z', source: 'Claude Code', ask: 'Wire the receipt PDF', summary: 'Receipts now email a PDF', files: ['pay.js'], project: 'shop-app' }] },
+        { name: 'Dana', entries: [{ ts: '2026-07-12T09:00:00.000Z', source: 'Codex', ask: 'Add refund guardrails', summary: null, files: [], project: 'shop-app' }] },
+      ],
+    });
+    check('briefing: generateBriefing needs a key and turns teammate activity into prose', () => {
+      assert.ok(briefNoKey.error && !briefNoKey.text, 'no-key path must return { error }, not text');
+      assert.ok(briefOk.text && !briefOk.error, `expected { text }, got ${JSON.stringify(briefOk)}`);
+      assert.ok(lastBriefingRequest, 'mock never saw a briefing request');
+      assert.ok(!lastBriefingRequest.output_config, 'a briefing must be plain text, never json_schema');
+      assert.strictEqual(lastBriefingRequest.max_tokens, 1200);
+      assert.strictEqual(lastBriefingRequest.thinking.type, 'disabled', 'sonnet must run with thinking off');
+      assert.ok(lastBriefingRequest.system.includes('catch-up'), 'briefing system prompt missing');
+      const userMsg = lastBriefingRequest.messages[0].content;
+      assert.ok(userMsg.includes('Andrew') && userMsg.includes('Dana'), 'teammate activity missing from the prompt');
+      assert.ok(userMsg.includes('Wire the receipt PDF') || userMsg.includes('Receipts now email a PDF'), 'ask/summary missing');
+    });
   } finally {
     child.kill();
     await new Promise(r => mockApi.close(r));
@@ -959,6 +1117,14 @@ async function main() {
       assert.ok(!JSON.stringify(dashboardTeam).includes(credsA.accessToken), 'access token exposed');
       assert.ok(!JSON.stringify(dashboardTeam).includes(credsA.refreshToken), 'refresh token exposed');
     });
+    check('dashboard: team payload surfaces member count and creation date', () => {
+      const t = dashboardTeam.teams.find(x => x.team_id === team.team_id);
+      assert.ok(t, 'team missing from payload');
+      assert.strictEqual(t.memberCount, 1, `expected 1 member, got ${t.memberCount}`);
+      assert.ok(t.createdAt && !Number.isNaN(Date.parse(t.createdAt)), 'createdAt missing or unparseable');
+      // raw RPC columns are preserved for older consumers
+      assert.ok('member_count' in t && 'created_at' in t, 'raw RPC columns dropped');
+    });
     const PORT4 = 17946;
     const srv4 = startServer(PORT4, { retries: 0 });
     try {
@@ -1017,6 +1183,13 @@ async function main() {
       assert.ok(!body.includes('sk-test1234567890abcdef'), 'secret reached the server');
       assert.ok(body.includes('[redacted'), 'redaction marker missing server-side');
       assert.ok(mock.entries.every(e => e.author_name === 'Marco'), 'author attribution wrong');
+    });
+    check('status: teamLastSync records a real wall-clock time after a successful sync', () => {
+      const before = statusPayload();
+      assert.ok(before.teamLastSync, 'teamLastSync missing after a successful team sync');
+      assert.ok(!Number.isNaN(Date.parse(before.teamLastSync)), 'teamLastSync is not an ISO timestamp');
+      // distinct field from the local injection time
+      assert.ok('lastSync' in before, 'lastSync field disappeared');
     });
 
     const pushedCount = mock.entries.length;
@@ -1193,6 +1366,27 @@ async function main() {
       const md = claudeMd();
       assert.ok(md.includes("Teammates' AI activity"), 'team section missing');
       assert.ok(md.includes('Andrew · Codex: Refactor checkout validation'), "Andrew's ask missing");
+    });
+
+    // check() is synchronous (fn() is called and awaited via try/catch only
+    // for synchronous throws) — an async fn would resolve after check() has
+    // already recorded a pass, making the assertions vacuous. So the async
+    // work is awaited here first, and a plain synchronous check() verifies
+    // the already-settled result, mirroring how every other awaited team
+    // assertion in this block is structured (await ...; check(() => {...})).
+    const savedTeamUrl = process.env.MEMBRIDGE_TEAM_URL;
+    process.env.MEMBRIDGE_TEAM_URL = 'http://127.0.0.1:1'; // unreachable -> teamUnavailable
+    let offlineFeedRes;
+    try {
+      offlineFeedRes = await feedPayload({ limit: 50 });
+    } finally {
+      process.env.MEMBRIDGE_TEAM_URL = savedTeamUrl;
+    }
+    check('feed: offline (degraded) branch still names teammates from cached teamEntries', () => {
+      assert.strictEqual(offlineFeedRes.teamUnavailable, true, 'expected degraded feed');
+      assert.ok(Array.isArray(offlineFeedRes.offlineTeammates), 'offlineTeammates should be an array');
+      assert.ok(offlineFeedRes.offlineTeammates.length >= 1, 'no teammate names derived from cached teamEntries');
+      assert.ok(!offlineFeedRes.offlineTeammates.includes('You'), 'self should not appear as a teammate');
     });
 
     // ----- team v2 (002_team_v2.sql): invite links, roles, feed, auto-link -----
@@ -1397,6 +1591,19 @@ async function main() {
       assert.ok(/receipt PDF/.test(teamEntry.summary), `summary text lost: ${teamEntry && teamEntry.summary}`);
     });
 
+    // Phase 1: /api/feed?since threads through to the team_feed RPC p_since arg.
+    // The receipt-PDF row above (ts 2026-07-13T10:00Z) is the recent fixture.
+    const teamSinceHit = await (await fetch(
+      `${hubBase}/api/feed?since=2026-07-13T09:00:00.000Z&limit=50`)).json();
+    const teamSinceMiss = await (await fetch(
+      `${hubBase}/api/feed?since=2099-01-01T00:00:00.000Z&limit=50`)).json();
+    check('/api/feed since= forwards to team_feed p_since (both directions)', () => {
+      assert.ok(teamSinceHit.entries.some(e => e.origin === 'team' && /receipt PDF/.test(e.summary || '')),
+        'recent team row should pass the since window');
+      assert.strictEqual(teamSinceMiss.entries.filter(e => e.origin === 'team').length, 0,
+        'future since window must exclude every team row');
+    });
+
     // Regression (Critical): the project page filters /api/feed by a local
     // filesystem path (`?project=/abs/path`), but team_feed's p_project is a
     // uuid. feedPayload must resolve a LINKED local path -> its team-project
@@ -1488,6 +1695,49 @@ async function main() {
       assert.ok(row.ask.includes('[redacted') && row.summary.includes('[redacted'),
         `pulled row not redacted: ${row.ask} / ${row.summary}`);
     });
+    // Catch-up briefing over the local API: teammate rows only, self excluded,
+    // grouped by author, and a no-key degrade. A throwaway Anthropic mock
+    // stands in for the (already-closed) roadmap mock; the in-process server
+    // reads MEMBRIDGE_API_BASE per call, so setting it now is enough.
+    let lastTeamBriefReq = null;
+    const briefMock = http.createServer((rq, rs) => {
+      const cs = [];
+      rq.on('data', c => cs.push(c));
+      rq.on('end', () => {
+        lastTeamBriefReq = JSON.parse(Buffer.concat(cs).toString('utf8'));
+        rs.writeHead(200, { 'Content-Type': 'application/json' });
+        rs.end(JSON.stringify({
+          model: lastTeamBriefReq.model,
+          stop_reason: 'end_turn',
+          content: [{ type: 'text', text: 'Andrew wired the receipt PDF; Dana added refund guardrails.' }],
+          usage: { input_tokens: 500, output_tokens: 60 },
+        }));
+      });
+    });
+    await new Promise(r => briefMock.listen(17948, '127.0.0.1', r));
+    process.env.MEMBRIDGE_API_BASE = 'http://127.0.0.1:17948';
+
+    await post(`${hubBase}/api/settings`, { apiKey: '' });
+    const briefDegraded = await (await post(`${hubBase}/api/briefing/generate`, {})).json();
+    await post(`${hubBase}/api/settings`, { apiKey: GOOD_KEY });
+    const briefRes = await (await post(`${hubBase}/api/briefing/generate`, { since: '2026-07-01T00:00:00.000Z' })).json();
+    check('briefing route: degrades without a key; briefs teammate activity with one', () => {
+      assert.strictEqual(briefDegraded.degraded, true, 'no-key path must degrade');
+      assert.ok(!briefDegraded.text, 'degraded path must not carry a briefing');
+      assert.strictEqual(briefRes.degraded, false);
+      assert.ok(briefRes.text && /receipt PDF/.test(briefRes.text), `briefing text missing: ${JSON.stringify(briefRes)}`);
+      assert.ok(briefRes.generatedAt, 'generatedAt missing');
+      assert.ok(lastTeamBriefReq, 'briefing mock never saw a request');
+      const userMsg = lastTeamBriefReq.messages[0].content;
+      assert.ok(userMsg.includes('Andrew'), 'teammate Andrew missing from the digest');
+      assert.ok(!/^##\s*You\b/m.test(userMsg), 'self rows leaked into the teammate digest');
+      const st = util.loadState();
+      assert.ok(st.catchup && st.catchup.briefing && /receipt PDF/.test(st.catchup.briefing.text),
+        'briefing not cached to state.catchup.briefing');
+      assert.strictEqual(st.catchup.briefing.since, '2026-07-01T00:00:00.000Z', 'cached since window wrong');
+    });
+    await post(`${hubBase}/api/settings`, { apiKey: '' });
+    await new Promise(r => briefMock.close(r));
     await new Promise(r => hubSrv.close(r));
 
     // Management runs on a fresh team so rotate/remove cannot disturb the
@@ -1588,6 +1838,96 @@ async function main() {
       const link = teamsync.loadTeamLink(erinApi);
       assert.ok(link, 'not auto-linked');
       assert.strictEqual(link.projectId, apiLink.projectId);
+    });
+
+    // ----- migration 005: project soft-delete (owner/manager, reversible) -----
+    // A fresh linked project so archiving never disturbs the shop-app fixtures.
+    process.env.MEMBRIDGE_HOME = HOME_A;
+    const projArch = path.join(ROOT, 'projects', 'archive-app');
+    fs.mkdirSync(projArch, { recursive: true });
+    fs.writeFileSync(path.join(projArch, 'CLAUDE.md'), '# Archive app\n');
+    const stArch = util.loadState();
+    stArch.projects[projArch] = {
+      events: [{ ts: '2026-07-13T09:00:00.000Z', source: 'Codex', kind: 'prompt', text: 'Draft the archive feature', session: 'arch1' }],
+    };
+    util.saveState(stArch);
+    const archLink = await teamsync.linkProject(util.getConfig(), projArch, team.team_id, 'Acme');
+    await teamsync.syncTeams({ project: projArch }); // push the entry so it appears in the feed
+
+    // A plain member (Dana, home-d) cannot archive: the RPC is manager-gated.
+    process.env.MEMBRIDGE_HOME = path.join(ROOT, 'home-d');
+    let memberArchErr = null;
+    try {
+      await teamsync.archiveProject(util.getConfig(), archLink.projectId);
+    } catch (err) {
+      memberArchErr = err;
+    }
+    check('archive: a plain member cannot delete a shared project for the team', () => {
+      assert.ok(memberArchErr && /owner or admin/i.test(memberArchErr.message), `said: ${memberArchErr && memberArchErr.message}`);
+      assert.ok(!mock.projects.find(p => p.id === archLink.projectId).archivedAt, 'project was archived by a non-manager');
+    });
+
+    // The owner archives it: gone from the projects payload and the feed.
+    process.env.MEMBRIDGE_HOME = HOME_A;
+    await teamsync.archiveProject(util.getConfig(), archLink.projectId);
+    const projsAfterArchive = await teamProjectsPayload(team.team_id);
+    const feedAfterArchive = await teamsync.teamFeed(util.getConfig(), team.team_id, { limit: 100 });
+    check('archive: owner archive hides the project from the projects payload and the feed', () => {
+      assert.ok(mock.projects.find(p => p.id === archLink.projectId).archivedAt, 'archived_at not set');
+      assert.ok(!projsAfterArchive.some(r => r.project_id === archLink.projectId), 'archived project still listed');
+      assert.ok(!feedAfterArchive.some(e => e.project_id === archLink.projectId), 'archived project rows still in the feed');
+    });
+
+    // Reversible: unarchive brings it back.
+    await teamsync.unarchiveProject(util.getConfig(), archLink.projectId);
+    const projsAfterRestore = await teamProjectsPayload(team.team_id);
+    check('archive: unarchive restores the project (reversible)', () => {
+      assert.ok(!mock.projects.find(p => p.id === archLink.projectId).archivedAt, 'archived_at not cleared');
+      assert.ok(projsAfterRestore.some(r => r.project_id === archLink.projectId), 'restored project missing from payload');
+    });
+
+    // The dashboard route. A plain member (Dana) can only unlink their own
+    // machine — never archive for the team.
+    process.env.MEMBRIDGE_HOME = path.join(ROOT, 'home-d');
+    const danaClone = path.join(ROOT, 'projects-d', 'archive-app');
+    fs.mkdirSync(danaClone, { recursive: true });
+    const stDana = util.loadState();
+    stDana.projects = { ...(stDana.projects || {}), [danaClone]: { events: [] } };
+    util.saveState(stDana);
+    await teamsync.linkProject(util.getConfig(), danaClone, team.team_id, 'Acme'); // same project row
+    const MEMBER_PORT = 17948;
+    const memberSrv = startServer(MEMBER_PORT, { retries: 0 });
+    await waitForHttp(`http://127.0.0.1:${MEMBER_PORT}/api/status`);
+    const memberDel = await (await fetch(`http://127.0.0.1:${MEMBER_PORT}/api/team/archive-project`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: danaClone }),
+    })).json();
+    await new Promise(r => memberSrv.close(r));
+    check('archive route: a plain member only unlinks locally, never archives for the team', () => {
+      assert.strictEqual(memberDel.scope, 'local');
+      assert.strictEqual(memberDel.archived, false);
+      assert.ok(memberDel.unlinked, 'member path did not unlink');
+      assert.ok(!fs.existsSync(path.join(danaClone, '.membridge', 'team.json')), 'member team.json survived');
+      assert.ok(!mock.projects.find(p => p.id === archLink.projectId).archivedAt, 'member call archived for the whole team');
+    });
+
+    // The owner deletes the shared project over the route: archived for the
+    // team AND fully cleaned up locally (team.json gone, project out of state).
+    process.env.MEMBRIDGE_HOME = HOME_A;
+    const OWNER_PORT = 17949;
+    const ownerSrv = startServer(OWNER_PORT, { retries: 0 });
+    await waitForHttp(`http://127.0.0.1:${OWNER_PORT}/api/status`);
+    const ownerDel = await (await fetch(`http://127.0.0.1:${OWNER_PORT}/api/team/archive-project`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: projArch }),
+    })).json();
+    await new Promise(r => ownerSrv.close(r));
+    check('archive route: owner delete archives for the team and cleans up locally', () => {
+      assert.strictEqual(ownerDel.scope, 'team');
+      assert.strictEqual(ownerDel.archived, true);
+      assert.ok(mock.projects.find(p => p.id === archLink.projectId).archivedAt, 'backend project not archived via the route');
+      assert.ok(!fs.existsSync(path.join(projArch, '.membridge', 'team.json')), 'team.json survived the archive');
+      assert.ok(!util.loadState().projects[projArch], 'project still in local state after delete');
     });
 
     // Privacy: entries never carry a foreign path — not even its basename.

@@ -33,6 +33,13 @@ create table if not exists public.projects (
   unique (team_id, name)
 );
 
+-- Soft-delete for shared projects (see migrations/005_project_archive.sql).
+-- Added via `alter ... add column if not exists` so it is backwards-compatible
+-- with already-live backends and pre-existing clients.
+alter table public.projects add column if not exists archived_at timestamptz;
+alter table public.projects
+  add column if not exists archived_by uuid references auth.users (id);
+
 create table if not exists public.memory_entries (
   id bigint generated always as identity primary key,
   project_id uuid not null references public.projects (id) on delete cascade,
@@ -40,7 +47,7 @@ create table if not exists public.memory_entries (
   author_name text not null,
   ts timestamptz not null,
   source text not null,
-  ask text not null check (char_length(ask) <= 400),
+  ask text check (char_length(ask) <= 400),
   files jsonb not null default '[]'::jsonb,
   session text,
   created_at timestamptz not null default now(),
@@ -193,13 +200,26 @@ $$;
 
 -- Teams the calling user belongs to (RLS-safe convenience for the CLI).
 create or replace function public.my_teams()
-returns table (team_id uuid, team_name text, role text, invite_code uuid)
+returns table (
+  team_id uuid,
+  team_name text,
+  role text,
+  invite_code uuid,
+  member_count bigint,
+  created_at timestamptz
+)
 language sql
 security definer
 set search_path = public
 stable
 as $$
-  select t.id, t.name, m.role, t.invite_code
+  select
+    t.id,
+    t.name,
+    m.role,
+    t.invite_code,
+    (select count(*) from public.team_members mc where mc.team_id = t.id),
+    t.created_at
   from public.team_members m
   join public.teams t on t.id = m.team_id
   where m.user_id = auth.uid()
