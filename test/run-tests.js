@@ -19,7 +19,7 @@ delete process.env.ANTHROPIC_API_KEY; // a real key on the dev machine must not 
 const util = require('../lib/util');
 const { syncOnce } = require('../lib/scan');
 const digest = require('../lib/digest');
-const { startServer, teamPayload, teamProjectsPayload } = require('../lib/server');
+const { startServer, teamPayload, teamProjectsPayload, statusPayload } = require('../lib/server');
 const teamsync = require('../lib/teamsync');
 const { createMockSupabase } = require('./mock-supabase');
 const advisorLib = require('../lib/advisor');
@@ -1032,6 +1032,13 @@ async function main() {
       assert.ok(!body.includes('sk-test1234567890abcdef'), 'secret reached the server');
       assert.ok(body.includes('[redacted'), 'redaction marker missing server-side');
       assert.ok(mock.entries.every(e => e.author_name === 'Marco'), 'author attribution wrong');
+    });
+    check('status: teamLastSync records a real wall-clock time after a successful sync', () => {
+      const before = statusPayload();
+      assert.ok(before.teamLastSync, 'teamLastSync missing after a successful team sync');
+      assert.ok(!Number.isNaN(Date.parse(before.teamLastSync)), 'teamLastSync is not an ISO timestamp');
+      // distinct field from the local injection time
+      assert.ok('lastSync' in before, 'lastSync field disappeared');
     });
 
     const pushedCount = mock.entries.length;
