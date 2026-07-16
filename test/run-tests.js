@@ -1306,7 +1306,7 @@ async function main() {
       assert.ok(!md.includes('sk-test1234567890abcdef'), 'secret leaked into teammate file');
     });
 
-    check('team: a pushed summary is pulled intact and renders as a Result line', () => {
+    check('team: a pushed summary is pulled intact and renders as a Did line', () => {
       assert.ok(mock.entries.some(e => e.summary && e.summary.includes('smoke test')),
         'summary missing from the pushed rows');
       const st = util.loadState();
@@ -1315,7 +1315,7 @@ async function main() {
       assert.ok(pulled, 'no pulled entry carries a summary');
       assert.ok(pulled.summary.includes('smoke test'), `summary was: ${pulled.summary}`);
       const md = read(path.join(projB, 'CLAUDE.md'));
-      assert.ok(md.includes('Result: '), 'Result line missing from the team section');
+      assert.ok(md.includes('Did: '), 'Did line missing from the team section');
       assert.ok(md.includes('smoke test'), 'summary text missing from the team section');
     });
 
@@ -1378,8 +1378,8 @@ async function main() {
       const md = mdOf({});
       assert.strictEqual(count(md, 'team ask '), 8, 'default cap is not 8');
       assert.ok(md.includes('team ask 4') && !md.includes('team ask 3'), 'not the newest entries');
-      assert.ok(md.includes('— files: lib/pay.js'), 'files line missing');
-      assert.ok(!md.includes('Result:'), 'summary-less entries rendered a Result line');
+      assert.ok(md.includes('Changes: lib/pay.js'), 'changes line missing');
+      assert.ok(!md.includes('Did:'), 'summary-less entries rendered a Did line');
       const md3 = mdOf({ teamInjectMax: 3 });
       assert.strictEqual(count(md3, 'team ask '), 3, 'explicit cap not honored');
       assert.ok(md3.includes('team ask 9') && !md3.includes('team ask 8'), 'cap did not keep the newest');
@@ -1409,7 +1409,7 @@ async function main() {
       const md = digest.renderBlock(trimProj, sess, cfgBase, 'CLAUDE.md');
       assert.strictEqual(count(md, 'checkpoint '), 1, 'session not collapsed to one entry');
       assert.ok(md.includes('checkpoint three') && md.includes('session complete'), 'newest checkpoint missing');
-      assert.strictEqual(count(md, 'Result: '), 1, 'expected exactly one Result line');
+      assert.strictEqual(count(md, 'Did: '), 1, 'expected exactly one Did line');
       assert.strictEqual(sess.teamEntries.length, 3, 'state array was truncated');
     });
 
@@ -2234,12 +2234,12 @@ async function main() {
   check('rich: a final text under 80 chars is not emitted as a summary', () => {
     assert.ok(!richEvents().some(e => e.kind === 'summary' && e.session === 'sessShort'), 'short text became a summary');
   });
-  check('rich: renderBlock groups by session with Ask/Result/Tasks/Files', () => {
+  check('rich: renderBlock groups by session with Ask/Did/Tasks/Changes', () => {
     const md = richMd();
     assert.ok(md.includes('Ask: Refactor the payment retry queue with backoff'), 'Ask line missing');
-    assert.ok(md.includes('Result: Refactored the payment retry queue'), 'Result line missing');
+    assert.ok(md.includes('Did: Refactored the payment retry queue'), 'Did line missing');
     assert.ok(md.includes('Tasks: 1/3 done'), 'Tasks line missing');
-    assert.ok(md.includes('Files: src/queue.js'), 'Files line missing');
+    assert.ok(md.includes('Changes: src/queue.js'), 'Changes line missing');
     // the summary-less session keeps the original one-line ask format
     assert.ok(md.includes('Claude Code: Quick tweak to the readme'), 'fallback one-liner missing');
   });
@@ -2334,13 +2334,29 @@ async function main() {
     const flat = digest.plainText('## Heading\n**bold** and `inline` text\n```js\nlet x = 1\n```\ncol a | col b');
     assert.strictEqual(flat, 'Heading bold and inline text let x = 1 col a col b');
     const line = richMd().split('\n').find(l => l.includes('Rewrote the scratch build runner'));
-    assert.ok(line && line.trim().startsWith('Result:'), 'flattened summary missing from the block');
-    assert.ok(!/[*`|#]/.test(line), `markdown survived into the Result line: ${line}`);
+    assert.ok(line && line.trim().startsWith('Did:'), 'flattened summary missing from the block');
+    assert.ok(!/[*`|#]/.test(line), `markdown survived into the Did line: ${line}`);
   });
   check('fix: a summary-only session renders Ask: (not captured)', () => {
     const md = richMd();
     assert.ok(md.includes('Ask: (not captured)'), 'placeholder Ask line missing');
     assert.ok(md.includes('finished wiring the webhook retries'), 'prompt-less summary missing');
+  });
+
+  check('renderBlock: shows Intent/Did/Changes, no 240-char blob truncation', () => {
+    const proj = { events: [
+      { ts: '2026-07-16T00:00:00.000Z', source: 'Claude Code', kind: 'prompt', session: 's1', text: 'do the mcp thing' },
+      { ts: '2026-07-16T00:01:00.000Z', source: 'Claude Code', kind: 'edit', session: 's1', file: '/repo/lib/mcp.js' },
+      { ts: '2026-07-16T00:02:00.000Z', source: 'Distilled', kind: 'summary', session: 's1',
+        text: 'Built a read-only MCP server with four tools.', goal: 'Expose memory to MCP clients',
+        decisions: 'read-only by design', gotchas: '', highlights: [{ file: 'lib/mcp.js', note: 'the server' }] },
+    ] };
+    const block = digest.renderBlock('/repo', proj, { distill: { enabled: true }, team: {} }, 'CLAUDE.md');
+    assert.ok(/Intent: Expose memory to MCP clients/.test(block), 'Intent line');
+    assert.ok(/Did: Built a read-only MCP server/.test(block), 'Did line');
+    assert.ok(/Notes:.*read-only by design/.test(block), 'Notes line');
+    assert.ok(/Changes:.*lib\/mcp\.js/.test(block), 'Changes line');
+    assert.ok(!/Result:/.test(block), 'no legacy Result label');
   });
 
   // Team push carries the redacted summary (fresh mock: section 8's is gone).
@@ -2804,7 +2820,7 @@ async function main() {
 
   check('checkpoint: block shows the latest checkpoint; memory.md/json hold the full ordered sequence', () => {
     const claude = read(path.join(projSeq, 'CLAUDE.md'));
-    assert.ok(claude.includes('Result: Checkpoint three'), 'block should show the latest checkpoint');
+    assert.ok(claude.includes('Did: Checkpoint three'), 'block should show the latest checkpoint');
     assert.ok(!claude.includes('Checkpoint one') && !claude.includes('Checkpoint two'), 'block should not show earlier checkpoints');
     assert.ok(!claude.includes('sk-seq-secret-42'), 'secret leaked into the block');
     const mem = read(path.join(projSeq, '.membridge', 'memory.md'));
@@ -2888,7 +2904,7 @@ async function main() {
   });
   check('checkpoint: multi-prompt session — injected block shows only the latest checkpoint', () => {
     const claude = read(path.join(projMp, 'CLAUDE.md'));
-    assert.ok(claude.includes('Result: Checkpoint beta'), 'block missing the latest checkpoint');
+    assert.ok(claude.includes('Did: Checkpoint beta'), 'block missing the latest checkpoint');
     assert.ok(!claude.includes('Checkpoint alpha'), 'block leaked an earlier checkpoint');
     assert.strictEqual(count(claude, 'Checkpoint beta'), 1, 'block repeated the checkpoint');
   });
