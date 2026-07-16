@@ -1488,6 +1488,11 @@ async function main() {
       const html = dashboard.dashboardPage();
       assert.ok(/changesHtml/.test(html), 'changesHtml helper present');
       assert.ok(/Intent/.test(html), 'Intent label present');
+      // Both card builders (feedEntryHtml for the main/project feed and
+      // catchupCardHtml for the Catch-Up headlines + Everything view) must
+      // call changesHtml — one match would mean only one path renders the
+      // triad, silently leaving the other on the old summary+files render.
+      assert.ok((html.match(/changesHtml\(/g) || []).length >= 2, 'changes rendered in both card paths');
     });
 
     // ----- team v2 (002_team_v2.sql): invite links, roles, feed, auto-link -----
