@@ -1378,7 +1378,7 @@ async function main() {
       const md = mdOf({});
       assert.strictEqual(count(md, 'team ask '), 8, 'default cap is not 8');
       assert.ok(md.includes('team ask 4') && !md.includes('team ask 3'), 'not the newest entries');
-      assert.ok(md.includes('Changes: lib/pay.js'), 'changes line missing');
+      assert.ok(md.includes('Files: lib/pay.js'), 'files line missing');
       assert.ok(!md.includes('Did:'), 'summary-less entries rendered a Did line');
       const md3 = mdOf({ teamInjectMax: 3 });
       assert.strictEqual(count(md3, 'team ask '), 3, 'explicit cap not honored');
