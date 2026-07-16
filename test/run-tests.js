@@ -244,6 +244,29 @@ async function main() {
     assert.strictEqual(out[0].add, null);
     assert.strictEqual(out[1].dep, true);
   });
+  check('changes: quoted spaced paths classify correctly', () => {
+    const runGit = args => {
+      if (args[0] === 'status') return '?? "new doc.md"\n D "sub/old file.txt"\n';
+      return ''; // no numstat rows
+    };
+    const out = changesLib.deriveChanges('/repo', ['new doc.md', 'sub/old file.txt'], [], { runGit });
+    const byFile = Object.fromEntries(out.map(c => [c.file, c.status]));
+    assert.strictEqual(byFile['new doc.md'], 'new');
+    assert.strictEqual(byFile['sub/old file.txt'], 'deleted');
+  });
+  check('changes: rename attributes destination status', () => {
+    const runGit = args => {
+      if (args[0] === 'status') return 'R  old.js -> src/new.js\n';
+      if (args[0] === 'diff') return '5\t2\t{old.js => src/new.js}\n';
+      return '';
+    };
+    const out = changesLib.deriveChanges('/repo', ['src/new.js'], [], { runGit });
+    assert.strictEqual(out.length, 1);
+    assert.strictEqual(out[0].file, 'src/new.js');
+    // rename dest present in status map (not the compound "old.js -> src/new.js" key)
+    assert.strictEqual(out[0].status, 'edited');
+    assert.strictEqual(out[0].add, null); // rename counts are best-effort null
+  });
   check('projectDetail: a teammate touch drives team-aware lastTouched + activeLabel + stats', () => {
     const state = util.loadState();
     const key = Object.keys(state.projects).find(k => path.basename(k) === 'shop-app');
