@@ -3098,6 +3098,50 @@ async function main() {
     assert.strictEqual(hooks.countSummaryLines(projCk, 'nope'), 0);
     assert.strictEqual(hooks.hasSummaryLine(projCk, 'ck1'), true);
   });
+  const HOOK_SCRIPT = path.join(__dirname, '..', 'lib', 'membridge-hook.js');
+  const runAppendCli = args => spawnSync(process.execPath, [HOOK_SCRIPT, 'append', ...args], { encoding: 'utf8' });
+  check('append: writes one validated line, creates .membridge, never truncates', () => {
+    const proj = path.join(ROOT, 'projects', 'append-app');
+    fs.mkdirSync(proj, { recursive: true });
+    const target = path.join(proj, '.membridge', 'summaries.jsonl');
+    const line = f => JSON.stringify({ session: 'ap1', ts: '2026-07-17T00:00:00Z', goal: 'g', did: 'shipped the thing', decisions: '', gotchas: '', highlights: [], ...f });
+    const out = runAppendCli([target, line({})]);
+    assert.strictEqual(out.status, 0, out.stderr);
+    assert.strictEqual(out.stdout, '', 'append must be silent on success');
+    const rows = read(target).trim().split('\n');
+    assert.strictEqual(rows.length, 1);
+    assert.strictEqual(JSON.parse(rows[0]).did, 'shipped the thing');
+    const out2 = runAppendCli([target, line({ did: 'second line' })]);
+    assert.strictEqual(out2.status, 0, out2.stderr);
+    const rows2 = read(target).trim().split('\n');
+    assert.strictEqual(rows2.length, 2, 'second append must not truncate the first');
+    assert.strictEqual(JSON.parse(rows2[1]).did, 'second line');
+  });
+  check('append: rejects bad input loudly and writes nothing', () => {
+    const proj = path.join(ROOT, 'projects', 'append-bad');
+    fs.mkdirSync(proj, { recursive: true });
+    const target = path.join(proj, '.membridge', 'summaries.jsonl');
+    const mk = f => JSON.stringify({ session: 's1', did: 'real work', ...f });
+    for (const [args, why] of [
+      [[target, 'not json {'], 'malformed JSON'],
+      [[target, '["array"]'], 'JSON but not an object'],
+      [[target, mk({ session: '  ' })], 'blank session'],
+      [[target, mk({ did: '' })], 'empty did'],
+      [[path.join(proj, 'elsewhere.jsonl'), mk({})], 'target not a .membridge/summaries.jsonl path'],
+      [[path.join(proj, 'evil.membridge', 'summaries.jsonl'), mk({})], 'suffix match but not a real .membridge dir'],
+      [[target], 'missing json argument'],
+    ]) {
+      const out = runAppendCli(args);
+      assert.notStrictEqual(out.status, 0, `${why}: expected non-zero exit`);
+      assert.ok(out.stderr.trim(), `${why}: expected a stderr message`);
+    }
+    assert.ok(!fs.existsSync(target), 'invalid input must write nothing');
+  });
+  check('append: bare invocation still runs the stop hook (allows on garbage stdin)', () => {
+    const out = spawnSync(process.execPath, [HOOK_SCRIPT], { input: 'not json', encoding: 'utf8' });
+    assert.strictEqual(out.status, 0);
+    assert.strictEqual(out.stdout, '');
+  });
   check('checkpoint: checkpointEvery below 1 or non-finite falls back to 4', () => {
     const rawCfg = util.loadUserConfig();
     rawCfg.distill = { enabled: true, minEdits: 1, checkpointEvery: 0 };
