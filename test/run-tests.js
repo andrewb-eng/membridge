@@ -2706,6 +2706,55 @@ async function main() {
     assert.deepStrictEqual(afterRemove.hooks.PreToolUse, seedSettings.hooks.PreToolUse, 'unrelated hooks changed');
     assert.strictEqual(afterRemove.model, 'opus');
   });
+  check('distill: setup-hooks installs the append auto-approve rule; remove-hooks strips it, user rules survive', () => {
+    const permFile = path.join(ROOT, 'claude-settings-perm.json');
+    fs.writeFileSync(permFile, JSON.stringify({ permissions: { allow: ['Bash(npm run test:*)'] } }, null, 2));
+    const env = { ...process.env, MEMBRIDGE_CLAUDE_SETTINGS: permFile };
+    spawnSync(process.execPath, [BIN, 'setup-hooks'], { env, encoding: 'utf8' });
+    const after = JSON.parse(read(permFile));
+    assert.ok(after.permissions.allow.includes(hooks.appendAllowRule()), 'allow rule missing after setup');
+    assert.ok(after.permissions.allow.includes('Bash(npm run test:*)'), 'user rule dropped by setup');
+    spawnSync(process.execPath, [BIN, 'setup-hooks'], { env, encoding: 'utf8' }); // idempotent
+    const after2 = JSON.parse(read(permFile));
+    assert.strictEqual(after2.permissions.allow.filter(r => /membridge/i.test(r)).length, 1, 'rule duplicated on re-run');
+    spawnSync(process.execPath, [BIN, 'remove-hooks'], { env, encoding: 'utf8' });
+    const after3 = JSON.parse(read(permFile));
+    const allow3 = ((after3.permissions || {}).allow) || [];
+    assert.ok(!allow3.some(r => /membridge/i.test(r)), 'rule not removed by remove-hooks');
+    assert.ok(allow3.includes('Bash(npm run test:*)'), 'user rule dropped by remove-hooks');
+  });
+  check('distill: remove-hooks preserves a user allow rule that merely contains "membridge"', () => {
+    const f = path.join(ROOT, 'claude-settings-usermembridge.json');
+    const userRule = 'Bash(npm test --prefix /Users/x/Documents/Membridge:*)';
+    fs.writeFileSync(f, JSON.stringify({ permissions: { allow: [userRule] } }, null, 2));
+    const env = { ...process.env, MEMBRIDGE_CLAUDE_SETTINGS: f };
+    spawnSync(process.execPath, [BIN, 'setup-hooks'], { env, encoding: 'utf8' });
+    let allow = JSON.parse(read(f)).permissions.allow;
+    assert.ok(allow.includes(userRule) && allow.includes(hooks.appendAllowRule()), 'setup should add ours and keep the user rule');
+    spawnSync(process.execPath, [BIN, 'remove-hooks'], { env, encoding: 'utf8' });
+    allow = ((JSON.parse(read(f)).permissions || {}).allow) || [];
+    assert.ok(allow.includes(userRule), 'remove-hooks deleted a user rule that only contains "membridge"');
+    assert.ok(!allow.includes(hooks.appendAllowRule()), 'our append rule should be gone');
+  });
+  check('distill: setup-hooks upgrades a stale append allow rule in place', () => {
+    const staleFile = path.join(ROOT, 'claude-settings-stale-rule.json');
+    fs.writeFileSync(staleFile, JSON.stringify({
+      permissions: { allow: ['Bash("/old/node" "/old/lib/membridge-hook.js" append:*)'] },
+    }, null, 2));
+    const env = { ...process.env, MEMBRIDGE_CLAUDE_SETTINGS: staleFile };
+    spawnSync(process.execPath, [BIN, 'setup-hooks'], { env, encoding: 'utf8' });
+    const after = JSON.parse(read(staleFile));
+    assert.deepStrictEqual(after.permissions.allow.filter(r => /membridge/i.test(r)), [hooks.appendAllowRule()], 'stale rule not rewritten to current form');
+  });
+  check('distill: setup-hooks refuses a settings file whose permissions shape is malformed', () => {
+    const badFile = path.join(ROOT, 'claude-settings-badperm.json');
+    const badBody = JSON.stringify({ permissions: [] });
+    fs.writeFileSync(badFile, badBody);
+    const env = { ...process.env, MEMBRIDGE_CLAUDE_SETTINGS: badFile };
+    const out = spawnSync(process.execPath, [BIN, 'setup-hooks'], { env, encoding: 'utf8' });
+    assert.ok(/refusing/i.test(out.stdout + out.stderr), 'expected a refusal message');
+    assert.strictEqual(read(badFile), badBody, 'malformed file must not be rewritten');
+  });
   // A settings.json MemBridge cannot safely parse must be refused, never
   // overwritten — a silent default-to-{} regression would wipe the user's
   // whole file (all their hooks, model, permissions).

@@ -81,10 +81,18 @@ replaces. Instead:
 - `setup-hooks` installs, alongside the Stop hook, one narrow
   `permissions.allow` prefix rule for that command in
   ~/.claude/settings.json; `remove-hooks` removes it. Same discipline as
-  the hook entries: never touch user rules, only add/remove entries
-  containing 'membridge'. The allowlisted surface is safe by
-  construction: the script can only append a validated line to a
-  `.membridge/summaries.jsonl` path, nothing else.
+  the hook entries: never touch user rules. Removal matches only
+  MemBridge's own append rule (a rule mentioning both 'membridge' and
+  'append'), not any rule that merely contains 'membridge', so a user rule
+  under a Membridge-named path survives. The allowlisted surface stays
+  narrow by two
+  mechanisms together: `runAppend` validates its input (well-formed line,
+  a real `.membridge/summaries.jsonl` target), so a matched call can only
+  append a summary line; and Claude Code evaluates compound shell commands
+  per-segment, so trailing shell operators after a matched `append …`
+  prefix (`&& …`, `; …`, pipes) are not covered by the rule and still
+  require approval. The prefix rule is narrow because of these two
+  properties, not merely because of the prefix string.
 
 ### Why nothing else changes
 
