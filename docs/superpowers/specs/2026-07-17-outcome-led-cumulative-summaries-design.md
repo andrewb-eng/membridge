@@ -23,10 +23,17 @@ last increment ("fixed the test flake"), not the session's outcome. The
 lines are also phrased as AI activity ("edited lib/feed.js"), not as a
 change to the project.
 
+Delivery is also intrusive: the blocked summary turn narrates itself
+("Summary line appended…"), and on default permission modes the raw shell
+append can raise a permission dialog — the user actively waits on, or
+answers to, bookkeeping they never asked to see.
+
 ## Design
 
-One seam changes: the Stop-hook prompt (`blockReason` in lib/hooks.js).
-Two edits to it; nothing else in the pipeline moves.
+Two seams change: the Stop-hook prompt (`blockReason` in lib/hooks.js)
+gets outcome-led cumulative content, and the delivery of the summary turn
+becomes discreet (one auto-approved tool call, no narration). The rest of
+the pipeline — storage, merge, render, team sync — moves not at all.
 
 ### 1. Outcome phrasing (all checkpoints)
 
@@ -42,6 +49,42 @@ Replace "cover ONLY the work done since your previous summary line" with:
 write a fresh line summarizing the **whole session so far** — it
 supersedes your earlier lines for this session; append only, never modify
 existing lines.
+
+### 3. Discreet delivery
+
+The blocked summary turn must feel like nothing happened: no prose, no
+permission dialog, one quiet tool row. Two parts:
+
+**No commentary.** `blockReason` additionally instructs: execute exactly
+ONE tool call; no commentary before or after; do not restate the summary
+in the reply. The visible turn shrinks to a single command row; the only
+irreducible time is generating the JSON line itself.
+
+**A canonical, allowlistable append command.** Raw shell appends cannot be
+narrowly auto-approved (Bash permission rules are prefix-matched; the
+target path sits at the end) — so on default permission modes the summary
+turn can degrade into a permission dialog, worse than the wait it
+replaces. Instead:
+
+- `membridge-hook.js` gains an argv-dispatched `append` mode:
+  `<node> <membridge-hook.js> append <summaries-path> '<json-line>'`.
+  It validates before writing — JSON parses; `session` and `did` are
+  non-empty strings; the target path ends in `.membridge/summaries.jsonl`
+  — creates the directory, and appends one line. Invalid input exits
+  non-zero with a one-line stderr message so the agent can correct and
+  retry; nothing is written. No argv → `runStop()` exactly as today.
+- `blockReason` names that exact command instead of "append a line of
+  JSON to <file>". This also removes the shell-quoting hazards of
+  hand-built appends (summaries containing quotes currently risk
+  mangling) and rejects malformed lines at write time instead of
+  silently skipping them at scan time.
+- `setup-hooks` installs, alongside the Stop hook, one narrow
+  `permissions.allow` prefix rule for that command in
+  ~/.claude/settings.json; `remove-hooks` removes it. Same discipline as
+  the hook entries: never touch user rules, only add/remove entries
+  containing 'membridge'. The allowlisted surface is safe by
+  construction: the script can only append a validated line to a
+  `.membridge/summaries.jsonl` path, nothing else.
 
 ### Why nothing else changes
 
@@ -77,21 +120,46 @@ cache, digest re-fed per update, metered key) — is deliberately avoided.
 
 ## Error handling
 
-Unchanged: the entire hook path fails open (any internal error logs and
+The stop path is unchanged: it fails open (any internal error logs and
 allows the stop). Malformed lines are skipped by `countSummaryLines` and
-`scanSummaries` exactly as today.
+`scanSummaries` exactly as today. The `append` mode is the one deliberate
+exception: it is agent-facing, not stop-blocking, so it fails loudly —
+invalid input exits non-zero with a one-line stderr message and writes
+nothing, letting the agent correct and retry within its summary turn.
 
 ## Testing
 
-Unit tests on `blockReason` (custom harness, test/run-tests.js):
+Custom harness (test/run-tests.js), per seam:
+
+`blockReason`:
 - n = 0: instruction asks for outcome-phrased `did` (what-changed-in-the-
   project wording present; no file-list phrasing requested).
 - n > 0: instruction asks for a whole-session-so-far line that supersedes
   earlier lines, and still forbids modifying existing lines.
-- Existing gate/count/merge tests unchanged and stay green.
+- Both variants name the canonical `append` command and the no-commentary
+  instruction.
+
+`append` mode:
+- Valid line → appended verbatim (one line, newline-terminated), directory
+  created when missing, exit 0.
+- Invalid JSON / empty `session` or `did` / target path not ending in
+  `.membridge/summaries.jsonl` → exit non-zero, stderr message, file
+  untouched.
+
+`setup-hooks` / `remove-hooks`:
+- setup installs the allow rule alongside the hook; remove deletes both;
+  user-owned permission entries are never touched; re-running setup is
+  idempotent and upgrades a stale command path in the rule.
+
+Existing gate/count/merge tests unchanged and stay green.
 
 ## Out of scope (YAGNI)
 
+- Fully silent generation via a background/daemon-run headless distiller
+  (`claude -p` over transcript tails) — considered and declined for now
+  in favor of discreet blocking: the live agent summarizes with full
+  context and warm cache, and no new process management enters the hook
+  path. Revisit if the discreet turn still feels intrusive in practice.
 - Demoting or folding no-delta sessions in the feed (admission bite —
   parked).
 - Making threads the feed unit sooner (unit bite — stays gated on the
