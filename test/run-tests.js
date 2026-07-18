@@ -3427,6 +3427,483 @@ async function main() {
     assert.ok(keychain.remove(acct), 'remove failed');
     assert.strictEqual(keychain.load(acct), null, 'load after remove must be null');
   });
+  // Identity bootstrap (ensureIdentity, plan Task 4): pure by injection, so
+  // every scenario runs offline against fakes — no network, no real keychain.
+  // Awaits happen at block level (check() doesn't await), wrapped so a missing
+  // helper fails the checks instead of killing the runner.
+  {
+    const mkIdFakes = (opts = {}) => {
+      const stored = new Map(opts.preload || []);
+      const calls = { store: [], upload: [], gen: 0 };
+      return {
+        stored, calls,
+        deps: {
+          keychain: {
+            available: () => opts.keychainAvailable !== false,
+            load: a => (stored.has(a) ? stored.get(a) : null),
+            store: (a, s) => {
+              calls.store.push(a);
+              if (opts.storeFails) return false;
+              stored.set(a, s);
+              return true;
+            },
+            remove: a => stored.delete(a),
+          },
+          teamcrypto: {
+            available: () => opts.cryptoAvailable !== false,
+            ready: async () => {},
+            genKeypair: () => {
+              calls.gen++;
+              return { publicKey: 'PUB' + calls.gen, privateKey: 'PRIV' + calls.gen };
+            },
+          },
+          uploadPubkey: async row => { calls.upload.push(row); },
+        },
+      };
+    };
+    const idCreds = { userId: 'user-1', accessToken: 'tok' };
+    let idErr = null;
+    const fresh = mkIdFakes();
+    const noCrypto = mkIdFakes({ cryptoAvailable: false });
+    const noChain = mkIdFakes({ keychainAvailable: false });
+    const halfPair = mkIdFakes({ preload: [['membridge.box.privatekey', 'ORPHAN-PRIV']] });
+    const badStore = mkIdFakes({ storeFails: true });
+    let id1, id2, idNoCrypto, idNoChain, idNoCreds, idHalf, idBadStore;
+    try {
+      id1 = await teamsync.ensureIdentity(idCreds, fresh.deps);
+      id2 = await teamsync.ensureIdentity(idCreds, fresh.deps);
+      idNoCrypto = await teamsync.ensureIdentity(idCreds, noCrypto.deps);
+      idNoChain = await teamsync.ensureIdentity(idCreds, noChain.deps);
+      idNoCreds = await teamsync.ensureIdentity(null, fresh.deps);
+      idHalf = await teamsync.ensureIdentity(idCreds, halfPair.deps);
+      idBadStore = await teamsync.ensureIdentity(idCreds, badStore.deps);
+    } catch (e) { idErr = e; }
+
+    check('teamsync: ensureIdentity first call generates a pair, stores both halves, uploads the pubkey once', () => {
+      assert.ok(!idErr, `ensureIdentity threw: ${idErr && idErr.message}`);
+      assert.deepStrictEqual(id1, { publicKey: 'PUB1', privateKey: 'PRIV1' });
+      assert.strictEqual(fresh.calls.gen, 1, 'expected exactly one keypair generation');
+      assert.strictEqual(fresh.stored.get('membridge.box.privatekey'), 'PRIV1', 'private key not stored');
+      assert.strictEqual(fresh.stored.get('membridge.box.publickey'), 'PUB1', 'public key not stored');
+      assert.deepStrictEqual(fresh.calls.upload, [{ user_id: 'user-1', public_key: 'PUB1' }],
+        'expected exactly one upload of { user_id, public_key }');
+    });
+
+    check('teamsync: ensureIdentity second call reuses the stored pair and does not re-upload', () => {
+      assert.ok(!idErr, `ensureIdentity threw: ${idErr && idErr.message}`);
+      assert.deepStrictEqual(id2, { publicKey: 'PUB1', privateKey: 'PRIV1' });
+      assert.strictEqual(fresh.calls.gen, 1, 'second call must not regenerate');
+      assert.strictEqual(fresh.calls.upload.length, 1, 'second call must not re-upload');
+    });
+
+    check('teamsync: ensureIdentity fails closed — unavailable crypto/keychain or missing creds return null, nothing stored or uploaded', () => {
+      assert.ok(!idErr, `ensureIdentity threw: ${idErr && idErr.message}`);
+      assert.strictEqual(idNoCrypto, null);
+      assert.strictEqual(noCrypto.calls.store.length + noCrypto.calls.upload.length, 0, 'unavailable crypto must be a no-op');
+      assert.strictEqual(idNoChain, null);
+      assert.strictEqual(noChain.calls.store.length + noChain.calls.upload.length, 0, 'unavailable keychain must be a no-op');
+      assert.strictEqual(idNoCreds, null, 'missing creds must return null');
+    });
+
+    check('teamsync: ensureIdentity self-heals a half-missing pair by regenerating and re-uploading', () => {
+      assert.ok(!idErr, `ensureIdentity threw: ${idErr && idErr.message}`);
+      assert.deepStrictEqual(idHalf, { publicKey: 'PUB1', privateKey: 'PRIV1' });
+      assert.strictEqual(halfPair.stored.get('membridge.box.privatekey'), 'PRIV1', 'orphaned private key must be replaced');
+      assert.strictEqual(halfPair.calls.upload.length, 1, 'regenerated pubkey must be uploaded');
+    });
+
+    check('teamsync: ensureIdentity returns null and uploads nothing when the keychain cannot persist the key', () => {
+      assert.ok(!idErr, `ensureIdentity threw: ${idErr && idErr.message}`);
+      assert.strictEqual(idBadStore, null, 'a key we cannot retain must not be reported as an identity');
+      assert.strictEqual(badStore.calls.upload.length, 0, 'must not upload a pubkey whose private half was not persisted');
+    });
+  }
+
+  // Team-key handling (resolveTeamKey, plan Task 5): same injected-deps
+  // convention as ensureIdentity above. deps.teamId names the team the
+  // closures are bound to (inserted rows carry it), deps.cache is the
+  // caller-owned per-sync-run Map — injection, not module state, so the
+  // "one pass" lifetime is the caller's by construction.
+  {
+    const mkKeyFakes = (opts = {}) => {
+      const calls = { fetchRow: 0, fetchRowEpochs: [], fetchMembers: 0, inserts: [], gen: 0, seal: [], unseal: 0 };
+      return {
+        calls,
+        deps: {
+          teamId: opts.teamId || 'team-1',
+          cache: opts.cache,
+          teamcrypto: {
+            available: () => opts.cryptoAvailable !== false,
+            ready: async () => {},
+            genTeamKey: () => { calls.gen++; return 'RAWKEY' + calls.gen; },
+            sealTeamKey: (key, pub) => { calls.seal.push([key, pub]); return `SEALED(${key}->${pub})`; },
+            unsealTeamKey: sealed => { calls.unseal++; return opts.unsealFails ? null : 'UNSEALED-' + sealed; },
+          },
+          fetchMySealedRow: async epoch => {
+            calls.fetchRow++;
+            calls.fetchRowEpochs.push(epoch);
+            return opts.myRow || null;
+          },
+          fetchMemberPubkeys: async () => { calls.fetchMembers++; return opts.members || []; },
+          insertSealedRows: async rows => { calls.inserts.push(rows); },
+        },
+      };
+    };
+    const keyIdentity = { publicKey: 'MYPUB', privateKey: 'MYPRIV' };
+    const twoMembers = [
+      { user_id: 'u-a', public_key: 'PUB-A' },
+      { user_id: 'u-b', public_key: 'PUB-B' },
+    ];
+    let tkErr = null;
+    const mint = mkKeyFakes({ members: twoMembers, teamId: 'team-mint' });
+    const have = mkKeyFakes({ myRow: { sealed_team_key: 'BLOB' }, teamId: 'team-have' });
+    const cached = mkKeyFakes({ myRow: { sealed_team_key: 'BLOB2' }, teamId: 'team-cache', cache: new Map() });
+    const badUnseal = mkKeyFakes({ myRow: { sealed_team_key: 'BAD' }, unsealFails: true, teamId: 'team-bad', cache: new Map() });
+    const noCrypto = mkKeyFakes({ cryptoAvailable: false, teamId: 'team-off' });
+    let kMint, kHave, kC1, kC2, kC3, kBad, kBadAgain, kOff, kNoId;
+    try {
+      kMint = await teamsync.resolveTeamKey(keyIdentity, 3, mint.deps);
+      kHave = await teamsync.resolveTeamKey(keyIdentity, 1, have.deps);
+      kC1 = await teamsync.resolveTeamKey(keyIdentity, 1, cached.deps);
+      kC2 = await teamsync.resolveTeamKey(keyIdentity, 1, cached.deps);   // same epoch: cache hit
+      kC3 = await teamsync.resolveTeamKey(keyIdentity, 2, cached.deps);   // new epoch: cache miss
+      kBad = await teamsync.resolveTeamKey(keyIdentity, 1, badUnseal.deps);
+      kBadAgain = await teamsync.resolveTeamKey(keyIdentity, 1, badUnseal.deps); // failure must not be cached
+      kOff = await teamsync.resolveTeamKey(keyIdentity, 1, noCrypto.deps);
+      kNoId = await teamsync.resolveTeamKey(null, 1, mkKeyFakes().deps);
+    } catch (e) { tkErr = e; }
+
+    check('teamsync: resolveTeamKey with no sealed row mints one key and inserts one sealed row per member', () => {
+      assert.ok(!tkErr, `resolveTeamKey threw: ${tkErr && tkErr.message}`);
+      assert.strictEqual(kMint, 'RAWKEY1');
+      assert.strictEqual(mint.calls.gen, 1, 'expected exactly one team-key generation');
+      assert.deepStrictEqual(mint.calls.fetchRowEpochs, [3], 'fetchMySealedRow must receive the epoch');
+      assert.strictEqual(mint.calls.inserts.length, 1, 'expected exactly one insert call');
+      assert.deepStrictEqual(mint.calls.inserts[0], [
+        { team_id: 'team-mint', epoch: 3, member_user_id: 'u-a', sealed_team_key: 'SEALED(RAWKEY1->PUB-A)' },
+        { team_id: 'team-mint', epoch: 3, member_user_id: 'u-b', sealed_team_key: 'SEALED(RAWKEY1->PUB-B)' },
+      ], 'one row per member, sealed to that member\'s pubkey');
+    });
+
+    check('teamsync: resolveTeamKey with an existing sealed row unseals it — no generation, no insert', () => {
+      assert.ok(!tkErr, `resolveTeamKey threw: ${tkErr && tkErr.message}`);
+      assert.strictEqual(kHave, 'UNSEALED-BLOB');
+      assert.strictEqual(have.calls.gen, 0, 'must not generate when a sealed row exists');
+      assert.strictEqual(have.calls.inserts.length, 0, 'must not insert when a sealed row exists');
+      assert.strictEqual(have.calls.fetchMembers, 0, 'must not fetch member pubkeys when a sealed row exists');
+    });
+
+    check('teamsync: resolveTeamKey caches per (team, epoch) for the injected cache\'s lifetime', () => {
+      assert.ok(!tkErr, `resolveTeamKey threw: ${tkErr && tkErr.message}`);
+      assert.strictEqual(kC1, 'UNSEALED-BLOB2');
+      assert.strictEqual(kC2, 'UNSEALED-BLOB2', 'second call must return the same key');
+      assert.strictEqual(cached.calls.fetchRow, 2, 'same epoch must be served from cache (1 fetch) + new epoch refetches (2nd)');
+      assert.strictEqual(cached.calls.fetchRowEpochs[1], 2, 'only the new epoch may refetch');
+      assert.strictEqual(kC3, 'UNSEALED-BLOB2', 'different epoch resolves independently (same fake blob)');
+    });
+
+    check('teamsync: resolveTeamKey fails closed — unseal failure or unavailable crypto/identity returns null with no inserts, and failures are never cached', () => {
+      assert.ok(!tkErr, `resolveTeamKey threw: ${tkErr && tkErr.message}`);
+      assert.strictEqual(kBad, null, 'unseal failure must return null');
+      assert.strictEqual(kBadAgain, null);
+      assert.strictEqual(badUnseal.calls.fetchRow, 2, 'a failed resolve must not be cached — second call refetches');
+      assert.strictEqual(badUnseal.calls.inserts.length, 0, 'unseal failure must not insert');
+      assert.strictEqual(kOff, null, 'unavailable crypto must return null');
+      assert.strictEqual(noCrypto.calls.fetchRow, 0, 'unavailable crypto must not fetch');
+      assert.strictEqual(kNoId, null, 'missing identity must return null');
+    });
+  }
+
+  // Encrypt-on-push (encryptRow + syncTeams wiring, plan Task 6 Part A).
+  // encryptRow is pure and tested with REAL libsodium (already ready()'d
+  // above — no keychain involved, so no machine side effects); the wiring's
+  // fail-closed path runs the real syncTeams against a fresh mock backend
+  // with injected unavailable crypto deps.
+  {
+    const tcReal = require('../lib/teamcrypto');
+    const pushRow = {
+      project_id: 'p-1', author_id: 'u-1', author_name: 'Marco',
+      ts: '2026-07-18T10:00:00.000Z', source: 'Claude Code', session: 's1',
+      ask: 'redacted ask', goal: null, decisions: 'kept it', gotchas: null,
+      files: ['src/a.js'], changes: null, summary: 'did the thing',
+    };
+    let encErr = null, encOff, encOn, encRound;
+    try {
+      encOff = teamsync.encryptRow(pushRow, null, 1, { teamcrypto: null });
+      const teamKey = tcReal.genTeamKey();
+      encOn = teamsync.encryptRow(pushRow, teamKey, 1, { teamcrypto: tcReal });
+      encRound = tcReal.decrypt(encOn.ciphertext, encOn.nonce, teamKey);
+    } catch (e) { encErr = e; }
+
+    check('teamsync: encryptRow with no team key returns the row unchanged (flag-off byte-identical)', () => {
+      assert.ok(!encErr, `encryptRow threw: ${encErr && encErr.message}`);
+      assert.strictEqual(encOff, pushRow, 'flag-off must return the SAME row object, not a copy');
+    });
+
+    check('teamsync: encryptRow dual-writes — ciphertext/nonce/key_epoch added, plaintext intact, payload round-trips', () => {
+      assert.ok(!encErr, `encryptRow threw: ${encErr && encErr.message}`);
+      assert.ok(encOn.ciphertext && encOn.nonce, 'ciphertext/nonce missing');
+      assert.strictEqual(encOn.key_epoch, 1);
+      assert.strictEqual(encOn.ask, 'redacted ask', 'plaintext ask must still be present (dual-write)');
+      assert.strictEqual(encOn.summary, 'did the thing', 'plaintext summary must still be present');
+      assert.strictEqual(encOn.project_id, 'p-1', 'metadata must be untouched');
+      assert.ok(!('ciphertext' in pushRow), 'input row must not be mutated');
+      assert.deepStrictEqual(encRound, {
+        ask: 'redacted ask', summary: 'did the thing', goal: null,
+        decisions: 'kept it', gotchas: null, files: ['src/a.js'], changes: null,
+      }, 'decrypting must return exactly the seven content fields');
+    });
+
+    // Fail-closed wiring: flag ON, crypto/keychain unavailable. The pass must
+    // push today's plaintext rows, never throw — and must LOG the fallback,
+    // which is what separates "the wiring engaged and failed closed" from
+    // "the flag was silently ignored" (this is the assertion that fails
+    // before the wiring exists).
+    {
+      const mockE = createMockSupabase();
+      await new Promise(r => mockE.server.listen(17952, '127.0.0.1', r));
+      const savedEnvUrl = process.env.MEMBRIDGE_TEAM_URL;
+      const savedEnvKey = process.env.MEMBRIDGE_TEAM_ANON_KEY;
+      process.env.MEMBRIDGE_TEAM_URL = 'http://127.0.0.1:17952';
+      process.env.MEMBRIDGE_TEAM_ANON_KEY = 'anon-test';
+      const projE = path.join(ROOT, 'projects', 'encrypt-app');
+      fs.mkdirSync(projE, { recursive: true });
+      let syncErr = null, syncRes = null, logDelta = '';
+      try {
+        await teamsync.signup(util.getConfig(), 'enc@test.dev', 'pw-e', 'Enc');
+        const teamE = await teamsync.createTeam(util.getConfig(), 'EncTeam');
+        await teamsync.linkProject(util.getConfig(), projE, teamE.team_id, 'EncTeam');
+        const st = util.loadState();
+        st.projects[projE] = { events: [
+          { ts: '2026-07-18T10:00:00.000Z', source: 'Claude Code', kind: 'prompt', text: 'encrypt me maybe', session: 'e1' },
+          { ts: '2026-07-18T10:01:00.000Z', source: 'Claude Code', kind: 'edit', file: path.join(projE, 'src', 'x.js'), session: 'e1' },
+        ] };
+        util.saveState(st);
+        const raw = util.loadUserConfig();
+        raw.team = { ...(raw.team || {}), encrypt: true };
+        util.saveUserConfig(raw);
+        let logBefore = 0;
+        try { logBefore = fs.statSync(util.logPath()).size; } catch {}
+        syncRes = await teamsync.syncTeams({
+          project: projE,
+          cryptoDeps: {
+            keychain: { available: () => false, load: () => null, store: () => false, remove: () => false },
+            teamcrypto: { available: () => false },
+            uploadPubkey: async () => { throw new Error('must not be called when unavailable'); },
+          },
+        });
+        try { logDelta = fs.readFileSync(util.logPath(), 'utf8').slice(logBefore); } catch {}
+      } catch (e) { syncErr = e; } finally {
+        const raw = util.loadUserConfig();
+        if (raw.team) { delete raw.team.encrypt; util.saveUserConfig(raw); }
+        process.env.MEMBRIDGE_TEAM_URL = savedEnvUrl;
+        process.env.MEMBRIDGE_TEAM_ANON_KEY = savedEnvKey;
+        mockE.server.close();
+      }
+      check('teamsync: flag-on push with unavailable crypto falls back to plaintext rows, logs it, never throws', () => {
+        assert.ok(!syncErr, `syncTeams threw: ${syncErr && syncErr.message}`);
+        assert.deepStrictEqual(syncRes.errors, [], `sync errors: ${JSON.stringify(syncRes && syncRes.errors)}`);
+        assert.ok(mockE.entries.length >= 1, 'expected at least one pushed row');
+        for (const r of mockE.entries) {
+          assert.ok(!('ciphertext' in r) && !('nonce' in r) && !('key_epoch' in r),
+            'unavailable crypto must push plaintext-only rows');
+        }
+        assert.ok(mockE.entries.some(e => /encrypt me maybe/.test(e.ask || '')), 'plaintext content missing from push');
+        assert.ok(/team encrypt/.test(logDelta),
+          'expected a logged "team encrypt" fallback line proving the flag path engaged fail-closed');
+      });
+    }
+  }
+
+  // Decrypt-on-pull + full round trip (plan Task 6 Part B). Two real homes
+  // against one mock backend: Alice mints the epoch key and pushes encrypted
+  // (dual-write), Bob unseals with his own keypair and pulls. Keychains are
+  // in-memory fakes (never the real macOS keychain); libsodium is real.
+  // cryptoDeps injects ONLY { keychain, teamcrypto } — uploadPubkey must be
+  // inherited from the real wiring (merge, not replace), which is itself part
+  // of what these tests pin.
+  {
+    const tcE2E = require('../lib/teamcrypto');
+    const mkMemKeychain = () => {
+      const m = new Map();
+      return {
+        available: () => true,
+        load: a => m.get(a) || null,
+        store: (a, s) => { m.set(a, s); return true; },
+        remove: a => m.delete(a),
+      };
+    };
+    const setTeamCfg = () => {
+      util.ensureConfig();
+      const raw = util.loadUserConfig();
+      raw.team = { ...(raw.team || {}), sharePrompts: true, encrypt: true };
+      util.saveUserConfig(raw);
+    };
+    const savedHome = process.env.MEMBRIDGE_HOME;
+    const savedUrl2 = process.env.MEMBRIDGE_TEAM_URL;
+    const savedKey2 = process.env.MEMBRIDGE_TEAM_ANON_KEY;
+    const homeAlice = path.join(ROOT, 'home-e2ea');
+    const homeBob = path.join(ROOT, 'home-e2eb');
+    const projE2E = path.join(ROOT, 'projects', 'e2e-app');
+    fs.mkdirSync(projE2E, { recursive: true });
+    const kcAlice = mkMemKeychain();
+    const kcBob = mkMemKeychain();
+    const mockE2E = createMockSupabase();
+    let e2eErr = null, resAlice = null, resBob = null, bobEntries = null, origRows = null;
+    try {
+      await new Promise(r => mockE2E.server.listen(17953, '127.0.0.1', r));
+      process.env.MEMBRIDGE_TEAM_URL = 'http://127.0.0.1:17953';
+      process.env.MEMBRIDGE_TEAM_ANON_KEY = 'anon-test';
+
+      // Alice: account, team, linked project.
+      process.env.MEMBRIDGE_HOME = homeAlice;
+      setTeamCfg();
+      await teamsync.signup(util.getConfig(), 'alice-e2e@test.dev', 'pw-a', 'Alice');
+      const teamE = await teamsync.createTeam(util.getConfig(), 'E2E');
+      const linkE = await teamsync.linkProject(util.getConfig(), projE2E, teamE.team_id, 'E2E');
+
+      // Bob joins and bootstraps his identity FIRST, so Alice's epoch-1 mint
+      // seals to both members.
+      process.env.MEMBRIDGE_HOME = homeBob;
+      setTeamCfg();
+      await teamsync.signup(util.getConfig(), 'bob-e2e@test.dev', 'pw-b', 'Bob');
+      await teamsync.joinTeam(util.getConfig(), teamE.invite_code);
+      await teamsync.syncTeams({ cryptoDeps: { keychain: kcBob, teamcrypto: tcE2E } });
+
+      // Alice: plant a session and push encrypted.
+      process.env.MEMBRIDGE_HOME = homeAlice;
+      const stA = util.loadState();
+      stA.projects[projE2E] = { events: [
+        { ts: '2026-07-18T12:00:00.000Z', source: 'Claude Code', kind: 'prompt', text: 'Ship the E2E slice token=sk-e2e-alice-999', session: 'e2e1' },
+        { ts: '2026-07-18T12:01:00.000Z', source: 'Claude Code', kind: 'edit', file: path.join(projE2E, 'src', 'core.js'), session: 'e2e1' },
+        { ts: '2026-07-18T12:02:00.000Z', source: 'Claude Code', kind: 'summary', text: 'Shipped the slice end to end', session: 'e2e1', decisions: 'sealed-box model kept' },
+      ] };
+      util.saveState(stA);
+      resAlice = await teamsync.syncTeams({ project: projE2E, cryptoDeps: { keychain: kcAlice, teamcrypto: tcE2E } });
+      origRows = mockE2E.entries.map(e => ({ ...e }));
+
+      // Tamper every stored plaintext column: a correct pull must recover
+      // content from the CIPHERTEXT, so the tampering must never surface.
+      for (const e of mockE2E.entries) {
+        if (e.ask) e.ask = 'TAMPERED ' + e.ask;
+        if (e.summary) e.summary = 'TAMPERED ' + e.summary;
+        if (e.decisions) e.decisions = 'TAMPERED';
+      }
+      // Plus one plaintext-only row (no ciphertext): must pull through as-is.
+      const alice = mockE2E.users.get('alice-e2e@test.dev');
+      mockE2E.entries.push({
+        project_id: linkE.projectId, author_id: alice.id, author_name: 'Alice',
+        ts: '2026-07-18T12:30:00.000Z', source: 'Codex', session: 'plain1',
+        ask: 'plain only row', goal: null, decisions: null, gotchas: null,
+        summary: 'no cipher here', files: ['docs/x.md'], changes: null,
+        created_at: new Date(Date.now() + 60000).toISOString(),
+      });
+
+      // Bob: pull and decrypt.
+      process.env.MEMBRIDGE_HOME = homeBob;
+      const stB = util.loadState();
+      stB.projects[projE2E] = { events: [] };
+      util.saveState(stB);
+      resBob = await teamsync.syncTeams({ project: projE2E, cryptoDeps: { keychain: kcBob, teamcrypto: tcE2E } });
+      bobEntries = (util.loadState().projects[projE2E] || {}).teamEntries || [];
+    } catch (e) { e2eErr = e; } finally {
+      process.env.MEMBRIDGE_HOME = savedHome;
+      process.env.MEMBRIDGE_TEAM_URL = savedUrl2;
+      process.env.MEMBRIDGE_TEAM_ANON_KEY = savedKey2;
+      mockE2E.server.close();
+    }
+
+    check('teamsync: flag-on push dual-writes ciphertext rows and seals the epoch key to every member', () => {
+      assert.ok(!e2eErr, `e2e scenario threw: ${e2eErr && e2eErr.message}`);
+      assert.deepStrictEqual(resAlice.errors, [], `alice sync errors: ${JSON.stringify(resAlice && resAlice.errors)}`);
+      assert.ok(origRows.length >= 1, 'expected pushed rows');
+      for (const r of origRows) {
+        assert.ok(r.ciphertext && r.nonce && r.key_epoch === 1, 'pushed row missing ciphertext/nonce/key_epoch');
+        assert.ok(!Buffer.from(r.ciphertext, 'base64').toString('latin1').includes('src/core.js'),
+          'file path visible in ciphertext bytes');
+      }
+      assert.ok(origRows.some(r => r.summary), 'plaintext summary must still be populated (dual-write)');
+      assert.strictEqual(mockE2E.pubkeys.size, 2, 'both members must have uploaded pubkeys');
+      assert.strictEqual(mockE2E.teamKeys.length, 2, 'epoch key must be sealed once to each member');
+    });
+
+    check('teamsync: pull decrypts ciphertext rows — tampered plaintext columns are ignored', () => {
+      assert.ok(!e2eErr, `e2e scenario threw: ${e2eErr && e2eErr.message}`);
+      assert.deepStrictEqual(resBob.errors, [], `bob sync errors: ${JSON.stringify(resBob && resBob.errors)}`);
+      const enc = bobEntries.filter(e => e.session === 'e2e1');
+      assert.ok(enc.length >= 1, `expected pulled encrypted-session entries, got ${JSON.stringify(bobEntries)}`);
+      assert.ok(!JSON.stringify(enc).includes('TAMPERED'),
+        'tampered plaintext surfaced — pull must take content from the ciphertext');
+    });
+
+    check('teamsync: pull keeps a plaintext-only row unchanged', () => {
+      assert.ok(!e2eErr, `e2e scenario threw: ${e2eErr && e2eErr.message}`);
+      const plain = bobEntries.find(e => e.session === 'plain1');
+      assert.ok(plain, 'plaintext-only row missing from pull');
+      assert.strictEqual(plain.ask, 'plain only row');
+      assert.strictEqual(plain.summary, 'no cipher here');
+      assert.deepStrictEqual(plain.files, ['docs/x.md']);
+    });
+
+    check('teamsync: round trip — Bob recovers exactly what Alice pushed, through the ciphertext', () => {
+      assert.ok(!e2eErr, `e2e scenario threw: ${e2eErr && e2eErr.message}`);
+      const orig = origRows.find(r => r.summary);
+      const got = bobEntries.find(e => e.session === 'e2e1' && e.summary);
+      assert.ok(orig && got, 'summary-bearing row missing on one side');
+      assert.strictEqual(got.ask, orig.ask, 'ask must round-trip identically');
+      assert.strictEqual(got.summary, orig.summary, 'summary must round-trip identically');
+      assert.strictEqual(got.decisions, orig.decisions, 'decisions must round-trip identically');
+      assert.deepStrictEqual(got.files, orig.files, 'files must round-trip identically');
+      assert.ok(!JSON.stringify(bobEntries).includes('sk-e2e-alice-999'),
+        'secret must have been redacted before encryption');
+    });
+
+    // Pre-migration backend (no 009 columns): flag-on push must drop the
+    // three new columns and land plaintext (PGRST204 retry), and the pull
+    // select must degrade instead of erroring. Fresh mock + home.
+    {
+      const mockPre = createMockSupabase();
+      mockPre.flags.rejectColumns.add('ciphertext');
+      mockPre.flags.rejectColumns.add('nonce');
+      mockPre.flags.rejectColumns.add('key_epoch');
+      const homeCarol = path.join(ROOT, 'home-e2ec');
+      const projPre = path.join(ROOT, 'projects', 'pre-app');
+      fs.mkdirSync(projPre, { recursive: true });
+      let preErr = null, resPre = null;
+      try {
+        await new Promise(r => mockPre.server.listen(17954, '127.0.0.1', r));
+        process.env.MEMBRIDGE_TEAM_URL = 'http://127.0.0.1:17954';
+        process.env.MEMBRIDGE_TEAM_ANON_KEY = 'anon-test';
+        process.env.MEMBRIDGE_HOME = homeCarol;
+        setTeamCfg();
+        await teamsync.signup(util.getConfig(), 'carol-e2e@test.dev', 'pw-c', 'Carol');
+        const teamP = await teamsync.createTeam(util.getConfig(), 'PreTeam');
+        await teamsync.linkProject(util.getConfig(), projPre, teamP.team_id, 'PreTeam');
+        const stC = util.loadState();
+        stC.projects[projPre] = { events: [
+          { ts: '2026-07-18T13:00:00.000Z', source: 'Claude Code', kind: 'prompt', text: 'premigration push', session: 'pre1' },
+        ] };
+        util.saveState(stC);
+        resPre = await teamsync.syncTeams({ project: projPre, cryptoDeps: { keychain: mkMemKeychain(), teamcrypto: tcE2E } });
+      } catch (e) { preErr = e; } finally {
+        process.env.MEMBRIDGE_HOME = savedHome;
+        process.env.MEMBRIDGE_TEAM_URL = savedUrl2;
+        process.env.MEMBRIDGE_TEAM_ANON_KEY = savedKey2;
+        mockPre.server.close();
+      }
+      check('teamsync: flag-on against a 009-less backend — push drops ciphertext/nonce/key_epoch and retries, pull select degrades, no errors', () => {
+        assert.ok(!preErr, `premigration scenario threw: ${preErr && preErr.message}`);
+        assert.deepStrictEqual(resPre.errors, [], `sync errors: ${JSON.stringify(resPre && resPre.errors)}`);
+        assert.ok(mockPre.entries.length >= 1, 'expected the push to land after dropping the new columns');
+        for (const r of mockPre.entries) {
+          assert.ok(!('ciphertext' in r) && !('nonce' in r) && !('key_epoch' in r),
+            'new columns must have been dropped for the old backend');
+        }
+        assert.ok(mockPre.entries.some(e => /premigration push/.test(e.ask || '')), 'plaintext content missing');
+        assert.strictEqual(mockPre.teamKeys.length, 1, 'the epoch mint itself must still succeed (team_keys has no flag)');
+      });
+    }
+  }
   check('redact: every default pattern removes the secret and emits a named marker', () => {
     for (const [name, input, secret] of cases) {
       const out = redactLib.redactDefault(input);
