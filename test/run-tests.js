@@ -3912,9 +3912,9 @@ async function main() {
     };
 
     const toolsList = await client.listTools();
-    check('mcp: exposes exactly the four read-only tools, all marked readOnlyHint', () => {
+    check('mcp: exposes exactly the five read-only tools, all marked readOnlyHint', () => {
       const names = toolsList.tools.map(t => t.name).sort();
-      assert.deepStrictEqual(names, ['get_project_memory', 'get_recent_activity', 'list_projects', 'search_memory']);
+      assert.deepStrictEqual(names, ['get_project_memory', 'get_recent_activity', 'list_projects', 'search_memory', 'why']);
       assert.ok(toolsList.tools.every(t => t.annotations && t.annotations.readOnlyHint === true), 'a tool is missing readOnlyHint');
       assert.ok(toolsList.tools.every(t => t.annotations.destructiveHint === false), 'a tool is missing destructiveHint:false');
     });
@@ -4000,8 +4000,9 @@ async function main() {
     await client.connect(transport);
     const tools = await client.listTools();
     check('mcp: `membridge mcp` starts a real stdio server and lists its tools', () => {
-      assert.strictEqual(tools.tools.length, 4);
+      assert.strictEqual(tools.tools.length, 5);
       assert.ok(tools.tools.some(t => t.name === 'list_projects'));
+      assert.ok(tools.tools.some(t => t.name === 'why'));
     });
     await client.close();
   }
@@ -4032,6 +4033,149 @@ async function main() {
       assert.ok(out.stderr.includes('npm install @modelcontextprotocol/sdk zod'), 'missing the actionable install command');
       assert.ok(!out.stdout.includes('UNREACHABLE'), 'execution continued past process.exit');
     });
+  }
+
+  // --- 15. Provenance (lib/provenance.js): `membridge why <file>` ---
+  // File-level only: which sessions edited a file, newest first. Event
+  // fixtures are passed as plain proj objects (same planting style as the
+  // teamEntries block above) — provenance is a pure reduction, so no scan
+  // pass is needed and a fixed `now` keeps the live flag deterministic.
+  {
+    const projWhy = path.join(ROOT, 'projects', 'why-app');
+    fs.mkdirSync(path.join(projWhy, 'src'), { recursive: true });
+    const whyNow = Date.parse('2026-07-18T12:00:00Z');
+    const whyEvents = [
+      { ts: '2026-07-18T09:00:00.000Z', source: 'Claude Code', kind: 'prompt', text: 'Refactor auth token=sk-why-secret-111 flow', session: 'w1' },
+      { ts: '2026-07-18T09:01:00.000Z', source: 'Claude Code', kind: 'edit', file: path.join(projWhy, 'src', 'auth.js'), session: 'w1' },
+      { ts: '2026-07-18T09:02:00.000Z', source: 'Claude Code', kind: 'edit', file: path.join(projWhy, 'src', 'other.js'), session: 'w1' },
+      { ts: '2026-07-18T09:03:00.000Z', source: 'Claude Code', kind: 'summary', text: 'Rewrote auth around token=sk-why-secret-222 rotation', session: 'w1', decisions: 'kept the sync API', gotchas: 'mind the token cache' },
+      { ts: '2026-07-18T10:00:00.000Z', source: 'Claude Code', kind: 'prompt', text: 'Docs pass', session: 'w3' },
+      { ts: '2026-07-18T10:01:00.000Z', source: 'Claude Code', kind: 'edit', file: path.join(projWhy, 'README.md'), session: 'w3' },
+      { ts: '2026-07-18T11:50:00.000Z', source: 'Codex', kind: 'prompt', text: 'Tighten auth error handling', session: 'w2' },
+      { ts: '2026-07-18T11:52:00.000Z', source: 'Codex', kind: 'edit', file: path.join(projWhy, 'src', 'auth.js'), session: 'w2' },
+    ];
+    const whyTeam = [
+      { author: 'Priya', ts: '2026-07-18T11:58:00.000Z', source: 'Codex', session: 'tp1', ask: 'harden auth token=sk-why-team-333', summary: 'refreshed session handling', files: ['src/auth.js'] },
+      { author: 'Priya', ts: '2026-07-17T08:00:00.000Z', source: 'Codex', session: 'tp2', ask: null, summary: 'unrelated docs work', files: ['docs/notes.md'] },
+    ];
+    const cfgWhy = util.getConfig();
+
+    let prov = null;
+    check('provenance: a multi-session file returns one row per session, newest first, with session fields', () => {
+      prov = require('../lib/provenance');
+      const rows = prov.fileProvenance(projWhy, { events: whyEvents }, cfgWhy, 'src/auth.js', whyNow);
+      assert.strictEqual(rows.length, 2, `expected 2 rows, got ${rows.length}`);
+      assert.strictEqual(rows[0].session, 'w2');
+      assert.strictEqual(rows[0].tool, 'Codex');
+      assert.strictEqual(rows[0].who, 'You');
+      assert.ok(/Tighten auth/.test(rows[0].ask), `w2 ask was: ${rows[0].ask}`);
+      assert.strictEqual(rows[0].summary, null, 'w2 has no summary');
+      assert.strictEqual(rows[1].session, 'w1');
+      assert.ok(/Rewrote auth/.test(rows[1].summary), `w1 summary was: ${rows[1].summary}`);
+      assert.ok(/kept the sync API/.test(rows[1].decisions), `w1 decisions was: ${rows[1].decisions}`);
+      assert.ok(/mind the token cache/.test(rows[1].gotchas), `w1 gotchas was: ${rows[1].gotchas}`);
+      assert.ok(String(rows[0].ts) > String(rows[1].ts), 'rows are not newest-first');
+    });
+
+    check('provenance: live is a time claim — only sessions active inside the stale window', () => {
+      assert.ok(prov, 'lib/provenance.js missing');
+      const rows = prov.fileProvenance(projWhy, { events: whyEvents }, cfgWhy, 'src/auth.js', whyNow);
+      assert.strictEqual(rows[0].live, true, 'w2 (10 min old) should be live');
+      assert.strictEqual(rows[1].live, false, 'w1 (3 h old) should not be live');
+    });
+
+    check('provenance: redacts secrets in ask and summary through the standard pipeline', () => {
+      assert.ok(prov, 'lib/provenance.js missing');
+      const rows = prov.fileProvenance(projWhy, { events: whyEvents, teamEntries: whyTeam }, cfgWhy, 'src/auth.js', whyNow);
+      const blob = JSON.stringify(rows);
+      assert.ok(!blob.includes('sk-why-secret-111') && !blob.includes('sk-why-secret-222') && !blob.includes('sk-why-team-333'),
+        'secret leaked into provenance');
+      assert.ok(count(blob, '[redacted') >= 3, 'expected redaction markers in local ask, local summary and teammate ask');
+    });
+
+    check('provenance: unknown or out-of-project file returns empty', () => {
+      assert.ok(prov, 'lib/provenance.js missing');
+      assert.deepStrictEqual(prov.fileProvenance(projWhy, { events: whyEvents }, cfgWhy, 'src/nope.js', whyNow), []);
+      assert.deepStrictEqual(prov.fileProvenance(projWhy, { events: whyEvents }, cfgWhy, '../outside.js', whyNow), []);
+    });
+
+    check('provenance: teammate sessions carrying the file appear with who=author, without team-slice trimming', () => {
+      assert.ok(prov, 'lib/provenance.js missing');
+      const rows = prov.fileProvenance(projWhy, { events: whyEvents, teamEntries: whyTeam }, cfgWhy, 'src/auth.js', whyNow);
+      assert.strictEqual(rows.length, 3, `expected 3 rows, got ${rows.length}`);
+      assert.strictEqual(rows[0].who, 'Priya');
+      assert.strictEqual(rows[0].session, 'tp1');
+      assert.ok(!rows.some(r => r.session === 'tp2'), 'a teammate row for a different file leaked in');
+    });
+
+    check('provenance: ./-prefixed and absolute in-project paths normalize to the same file', () => {
+      assert.ok(prov, 'lib/provenance.js missing');
+      const base = prov.fileProvenance(projWhy, { events: whyEvents }, cfgWhy, 'src/auth.js', whyNow);
+      const dot = prov.fileProvenance(projWhy, { events: whyEvents }, cfgWhy, './src/auth.js', whyNow);
+      const abs = prov.fileProvenance(projWhy, { events: whyEvents }, cfgWhy, path.join(projWhy, 'src', 'auth.js'), whyNow);
+      assert.deepStrictEqual(dot, base);
+      assert.deepStrictEqual(abs, base);
+    });
+
+    // CLI wiring: spawn the real binary from a project SUBDIR — resolveRoot
+    // must walk up to the tracked root, and output must be newest-first and
+    // redacted. State is planted on disk for the subprocess to read.
+    {
+      const st = util.loadState();
+      st.projects[projWhy] = { events: whyEvents, teamEntries: whyTeam };
+      util.saveState(st);
+      const out = spawnSync(process.execPath, [BIN, 'why', 'auth.js'],
+        { cwd: path.join(projWhy, 'src'), encoding: 'utf8', env: process.env });
+      check('why: `membridge why <file>` prints newest-first, redacted provenance from a subdir', () => {
+        assert.strictEqual(out.status, 0, `exit ${out.status}, stderr: ${out.stderr}`);
+        assert.ok(out.stdout.includes('src/auth.js'), `stdout: ${out.stdout}`);
+        const iPriya = out.stdout.indexOf('Priya');
+        const iCodex = out.stdout.indexOf('Codex');
+        const iClaude = out.stdout.indexOf('Claude Code');
+        assert.ok(iPriya !== -1 && iCodex !== -1 && iClaude !== -1, `stdout: ${out.stdout}`);
+        assert.ok(iPriya < iClaude, 'teammate (newest) should print before the oldest local session');
+        assert.ok(!out.stdout.includes('sk-why-secret-111') && !out.stdout.includes('sk-why-team-333'), 'secret leaked into CLI output');
+        assert.ok(out.stdout.includes('[redacted'), 'no redaction marker in CLI output');
+      });
+      const miss = spawnSync(process.execPath, [BIN, 'why', 'no-such-file.js'],
+        { cwd: projWhy, encoding: 'utf8', env: process.env });
+      check('why: unknown file inside a tracked project prints a friendly empty result', () => {
+        assert.strictEqual(miss.status, 0, `exit ${miss.status}, stderr: ${miss.stderr}`);
+        assert.ok(/No recorded AI edits/i.test(miss.stdout), `stdout: ${miss.stdout}`);
+      });
+    }
+
+    // MCP round trip: the 5th read-only tool over the same provenance module,
+    // redacted at the boundary exactly like the other four.
+    {
+      const [whyCt, whySt] = InMemoryTransport.createLinkedPair();
+      const whyServer = mcpMod.createServer();
+      const whyClient = new McpClient({ name: 'why-test-client', version: '1.0.0' });
+      await Promise.all([whyServer.connect(whySt), whyClient.connect(whyCt)]);
+      const callJson = async (name, a) => {
+        const res = await whyClient.callTool({ name, arguments: a || {} });
+        return { res, data: JSON.parse(res.content[0].text) };
+      };
+      let whyErr = null, whyData = null, whyMissData = null, whyBadRes = null;
+      try {
+        whyData = (await callJson('why', { project: projWhy, file: 'src/auth.js' })).data;
+        whyMissData = (await callJson('why', { project: projWhy, file: 'src/nope.js' })).data;
+        whyBadRes = (await callJson('why', { project: path.join(ROOT, 'projects', 'nope-app'), file: 'x.js' })).res;
+      } catch (e) { whyErr = e; }
+      check('mcp: why(file) round trip — sessions newest-first, redacted, empty for unknown file, isError for unknown project', () => {
+        assert.ok(!whyErr, `why call failed: ${whyErr && whyErr.message}`);
+        assert.strictEqual(whyData.file, 'src/auth.js');
+        assert.strictEqual(whyData.sessions.length, 3, `expected 3 sessions, got ${whyData.sessions.length}`);
+        assert.strictEqual(whyData.sessions[0].who, 'Priya');
+        assert.strictEqual(whyData.sessions[2].session, 'w1');
+        const blob = JSON.stringify(whyData);
+        assert.ok(!blob.includes('sk-why-secret-111') && !blob.includes('sk-why-secret-222') && !blob.includes('sk-why-team-333'),
+          'secret leaked through the MCP boundary');
+        assert.deepStrictEqual(whyMissData.sessions, []);
+        assert.strictEqual(whyBadRes.isError, true);
+      });
+      await whyClient.close();
+    }
   }
 
   check('project-resolve: resolveRoot returns nearest tracked ancestor, else null', () => {

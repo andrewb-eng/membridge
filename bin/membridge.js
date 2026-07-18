@@ -271,6 +271,59 @@ async function cmdMcp() {
   await require('../lib/mcp').startMcpServer();
 }
 
+// File-level provenance: which AI sessions (yours and teammates') edited a
+// file, newest first. Works from any subdirectory — the file argument is
+// resolved against cwd, then walked up to the nearest tracked project root.
+// The file does not have to exist on disk: a deleted file's history is still
+// a legitimate provenance question.
+function cmdWhy() {
+  const fileArg = args[1];
+  if (!fileArg || fileArg.startsWith('--')) die('Usage: membridge why <file>  (run inside a tracked project)');
+  const state = util.loadState();
+  const config = util.getConfig();
+  const projectResolve = require('../lib/project-resolve');
+  const provenance = require('../lib/provenance');
+  // Shell cwd is realpath'd by node, while project keys come from tool logs
+  // and may spell the same directory through a symlink (macOS /var ->
+  // /private/var, symlinked homes). Track BOTH spellings of every key and
+  // map whichever one the walk finds back to the state key. The file itself
+  // may not exist (a deleted file's history is still a fair question), so
+  // only its parent directory is realpath'd, and only best-effort.
+  let abs = path.resolve(process.cwd(), fileArg);
+  try {
+    abs = path.join(fs.realpathSync(path.dirname(abs)), path.basename(abs));
+  } catch {}
+  const trackedKeys = new Map();
+  for (const k of Object.keys(state.projects || {})) {
+    trackedKeys.set(util.normPath(k), k);
+    try {
+      trackedKeys.set(util.normPath(fs.realpathSync(k)), k);
+    } catch {}
+  }
+  const root = projectResolve.resolveRoot(abs, new Set(trackedKeys.keys()));
+  const key = root && (trackedKeys.get(util.normPath(root)) || findProjectKey(state, root));
+  if (!key) die(`${fileArg} is not inside a tracked project — no MemBridge activity recorded there.`);
+  // Relativize against `root` (the spelling the walk matched, an ancestor of
+  // abs) and hand fileProvenance the RELATIVE path — relative paths are
+  // spelling-independent, so the key's own spelling no longer matters.
+  const rel = provenance.normalizeRel(root, abs);
+  if (!rel) die(`${fileArg} is not inside a tracked project — no MemBridge activity recorded there.`);
+  const rows = provenance.fileProvenance(key, state.projects[key], config, rel);
+  if (!rows.length) {
+    console.log(`No recorded AI edits for ${rel} in ${key}.`);
+    return;
+  }
+  console.log(`Why ${rel} — ${rows.length} session(s), newest first:\n`);
+  for (const r of rows) {
+    console.log(`${digest.shortDate(r.ts)} · ${r.who} · ${r.tool}${r.live ? '  [working now]' : ''}`);
+    console.log(`  Ask: ${r.ask || '(prompt not shared)'}`);
+    if (r.summary) console.log(`  Did: ${r.summary}`);
+    const notes = [r.decisions, r.gotchas].filter(Boolean).join(' · ');
+    if (notes) console.log(`  Notes: ${notes}`);
+    console.log('');
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Team sync commands (Supabase backend, see supabase/schema.sql + README)
 // ---------------------------------------------------------------------------
@@ -507,6 +560,7 @@ Usage: membridge <command>
   dashboard           open the local web dashboard (starts daemon if needed)
   sync [--dry-run] [--project <path>]   one sync pass right now
   scan                read-only: show which tools/projects were discovered
+  why <file>          which AI sessions edited this file, newest first
   remove [--project <path>]             strip injected memory blocks
   enable-autostart    launch MemBridge automatically at login
   disable-autostart   remove the login launcher
@@ -549,6 +603,7 @@ Docs:   https://github.com/mmelika/membridge#readme`);
 const commands = {
   sync: cmdSync,
   scan: cmdScan,
+  why: cmdWhy,
   daemon: cmdDaemon,
   start: cmdStart,
   stop: cmdStop,
