@@ -5991,6 +5991,58 @@ async function main() {
     });
   }
 
+  // --- Weekend gap (validator/attacker regression, round 4) ----------------
+  // The sanity clamp must be anchored to the WALL CLOCK, not to the newest
+  // pending commit: a Friday-evening last-act commit followed by a legit
+  // >24h quiet gap must not turn Monday's real events into "corrupt future"
+  // timestamps — that froze settling (and stretched the eviction window)
+  // until the NEXT local commit happened to move the old anchor. Corruption
+  // is an event claiming to be from the machine's own future, nothing else.
+  {
+    const HOUR = 3600 * 1000;
+    const T0 = Date.now() - 63 * HOUR; // Friday evening, ~2.6 days ago
+    const projWk = path.join(ROOT, 'projects', 'weekend-gap-app');
+    fs.mkdirSync(path.join(projWk, 'src'), { recursive: true });
+    const gwk = (args, env) => spawnSync('git', ['-C', projWk, ...args],
+      { encoding: 'utf8', env: { ...process.env, ...(env || {}) } });
+    gwk(['init', '-q']);
+    gwk(['config', 'user.email', 'wk@local.dev']);
+    gwk(['config', 'user.name', 'WK']);
+    // The author's edit is scanned, then the commit lands Friday evening as
+    // the session's last act.
+    {
+      const st = util.loadState();
+      st.projects[projWk] = { events: [
+        { ts: new Date(T0 - 60000).toISOString(), source: 'Claude Code', kind: 'edit', file: path.join(projWk, 'src', 'only.js'), session: 'authorS' },
+      ] };
+      util.saveState(st);
+    }
+    fs.writeFileSync(path.join(projWk, 'src', 'only.js'), 'friday work\n');
+    gwk(['add', '-A']);
+    gwk(['commit', '-q', '-m', 'friday last act'],
+      { GIT_AUTHOR_DATE: new Date(T0).toISOString(), GIT_COMMITTER_DATE: new Date(T0).toISOString() });
+    const wkSha = gwk(['rev-parse', 'HEAD']).stdout.trim();
+    syncOnce({ project: projWk }); // walk records provisional; nothing newer than the commit yet
+    // Monday: the author's own session resumes (>24h after the commit) plus
+    // fresh unrelated activity — all with correct clocks, all in the PAST.
+    {
+      const st = util.loadState();
+      st.projects[projWk].events.push(
+        { ts: new Date(Date.now() - 2 * HOUR).toISOString(), source: 'Claude Code', kind: 'prompt', text: 'resume Monday', session: 'authorS' },
+        { ts: new Date(Date.now() - 60000).toISOString(), source: 'Codex', kind: 'prompt', text: 'other work', session: 'otherS' });
+      util.saveState(st);
+    }
+    syncOnce({ project: projWk });
+    check('weekend gap: a legit >24h quiet gap must not freeze settling — the resumed session settles the row attributed, no next commit needed', () => {
+      const rec = require('../lib/commits').loadCommitMap(projWk).find(r => r.sha === wkSha);
+      assert.ok(rec, 'commit not recorded');
+      assert.notStrictEqual(rec.provisional, true,
+        'Monday events are real, past-tense data — the clamp must not discard them just because the last pending commit was Friday');
+      assert.deepStrictEqual(rec.sessions, [{ session: 'authorS', files: ['src/only.js'] }],
+        'the author\'s own resumed event satisfies the per-session fast path');
+    });
+  }
+
   // --- Phase 3 Task 1: authorship gate end-to-end over a real repo ---------
   // A commit whose committer is the local identity is attributed; a commit
   // pulled from a teammate (foreign committer) is recorded unattributed-locally
