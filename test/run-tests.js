@@ -5143,6 +5143,109 @@ async function main() {
       assert.strictEqual(commits.lastRecordedSha(projTorn), 'bbb');
     });
 
+    // --- Task 3: O(1) idempotency check + dedupe-by-sha on read -------------
+
+    check('commits: lastRecordedSha is a cheap tail read — never parses the whole file', () => {
+      const projTail = path.join(ROOT, 'projects', 'commit-tail-app');
+      fs.mkdirSync(path.join(projTail, '.membridge'), { recursive: true });
+      const file = path.join(projTail, '.membridge', 'commits.jsonl');
+      // A large garbage line planted early would be observed by a full-file
+      // parse (loadCommitMap already tolerates it, but a cheap check must
+      // never even read this far back into the file).
+      fs.writeFileSync(file, 'NOT JSON ' + 'x'.repeat(20000) + '\n');
+      for (let i = 0; i < 500; i++) {
+        fs.appendFileSync(file, JSON.stringify({ sha: `s${i}`, ts: 't', project: projTail, sessions: [], unattributed: [] }) + '\n');
+      }
+      const origReadFile = fs.readFileSync;
+      let readFileCalls = 0;
+      fs.readFileSync = function (...args) { readFileCalls++; return origReadFile.apply(fs, args); };
+      try {
+        assert.strictEqual(commits.lastRecordedSha(projTail), 's499');
+      } finally {
+        fs.readFileSync = origReadFile;
+      }
+      assert.strictEqual(readFileCalls, 0, `lastRecordedSha must not full-parse the file (readFileSync called ${readFileCalls}x)`);
+    });
+
+    check('commits: lastRecordedSha stays correct even when the last record is bigger than the tail window', () => {
+      const projBig = path.join(ROOT, 'projects', 'commit-bigrec-app');
+      fs.mkdirSync(path.join(projBig, '.membridge'), { recursive: true });
+      const file = path.join(projBig, '.membridge', 'commits.jsonl');
+      fs.writeFileSync(file, JSON.stringify({ sha: 'small1', ts: 't', project: projBig, sessions: [], unattributed: [] }) + '\n');
+      // A record that alone exceeds any reasonable tail-read window (many
+      // files in one commit) — the cheap path must fall back to a full parse
+      // rather than return a wrong/partial answer.
+      const manyFiles = Array.from({ length: 2000 }, (_, i) => `src/file${i}.js`);
+      const bigRec = { sha: 'bigrecordsha', ts: 't', project: projBig, sessions: [{ session: 'w1', files: manyFiles }], unattributed: [] };
+      fs.appendFileSync(file, JSON.stringify(bigRec) + '\n');
+      assert.strictEqual(commits.lastRecordedSha(projBig), 'bigrecordsha');
+      assert.deepStrictEqual(commits.loadCommitMap(projBig).map(r => r.sha), ['small1', 'bigrecordsha']);
+    });
+
+    check('commits: lastRecordedSha fallback tracks the physically-last write, not dedup-by-sha order', () => {
+      // A pathological but possible file: sha A, then sha B, then sha A again
+      // (a legitimate non-consecutive duplicate — see the division-of-labor
+      // comment) as the physically LAST line, made big enough to force the
+      // tail-read into its full-parse fallback. Dedup-by-sha's first-seen
+      // ordering would put A before B and answer 'B' here; the physically
+      // last write is really 'A', and that's what a writer's idempotency
+      // check must see.
+      const projOrder = path.join(ROOT, 'projects', 'commit-fallback-order-app');
+      fs.mkdirSync(path.join(projOrder, '.membridge'), { recursive: true });
+      const file = path.join(projOrder, '.membridge', 'commits.jsonl');
+      const manyFiles = Array.from({ length: 2000 }, (_, i) => `src/file${i}.js`);
+      fs.writeFileSync(file, JSON.stringify({ sha: 'A', ts: 't1', project: projOrder, sessions: [], unattributed: [] }) + '\n');
+      fs.appendFileSync(file, JSON.stringify({ sha: 'B', ts: 't2', project: projOrder, sessions: [], unattributed: ['b.js'] }) + '\n');
+      fs.appendFileSync(file, JSON.stringify({ sha: 'A', ts: 't3', project: projOrder, sessions: [{ session: 'w1', files: manyFiles }], unattributed: [] }) + '\n');
+      assert.strictEqual(commits.lastRecordedSha(projOrder), 'A');
+    });
+
+    check('commits: lastRecordedSha degrades to null (never throws) for a missing/unreadable file', () => {
+      const projMissing = path.join(ROOT, 'projects', 'commit-idem-missing-app');
+      assert.strictEqual(commits.lastRecordedSha(projMissing), null);
+    });
+
+    check('commits: dedupe-by-sha keeps one row — a real-session row beats an empty-session row, either write order', () => {
+      const projDedupA = path.join(ROOT, 'projects', 'commit-dedupe-a-app');
+      fs.mkdirSync(path.join(projDedupA, '.membridge'), { recursive: true });
+      const empty = { sha: 'dup1', ts: 't1', project: projDedupA, sessions: [], unattributed: ['x.js'] };
+      const real = { sha: 'dup1', ts: 't2', project: projDedupA, sessions: [{ session: 'w1', files: ['x.js'] }], unattributed: [] };
+      commits.recordCommit(projDedupA, empty);
+      commits.recordCommit(projDedupA, real);
+      const mapA = commits.loadCommitMap(projDedupA);
+      assert.strictEqual(mapA.length, 1, `expected 1 deduped row, got ${JSON.stringify(mapA)}`);
+      assert.deepStrictEqual(mapA[0], real, 'the real-session row must win over the empty one');
+
+      const projDedupB = path.join(ROOT, 'projects', 'commit-dedupe-b-app');
+      fs.mkdirSync(path.join(projDedupB, '.membridge'), { recursive: true });
+      commits.recordCommit(projDedupB, real);
+      commits.recordCommit(projDedupB, empty);
+      const mapB = commits.loadCommitMap(projDedupB);
+      assert.strictEqual(mapB.length, 1, `expected 1 deduped row, got ${JSON.stringify(mapB)}`);
+      assert.deepStrictEqual(mapB[0], real, 'the real-session row must win over the empty one, reverse write order too');
+    });
+
+    check('commits: dedupe-by-sha — two consecutive identical writes for the same sha produce one row', () => {
+      const projDedupC = path.join(ROOT, 'projects', 'commit-dedupe-c-app');
+      fs.mkdirSync(path.join(projDedupC, '.membridge'), { recursive: true });
+      const rec = { sha: 'dup2', ts: 't1', project: projDedupC, sessions: [{ session: 'w1', files: ['a.js'] }], unattributed: [] };
+      commits.recordCommit(projDedupC, rec);
+      commits.recordCommit(projDedupC, rec);
+      const mapC = commits.loadCommitMap(projDedupC);
+      assert.strictEqual(mapC.length, 1, `expected 1 row for a consecutive duplicate write, got ${JSON.stringify(mapC)}`);
+      assert.deepStrictEqual(mapC[0], rec);
+    });
+
+    check('commits: dedupe-by-sha does not disturb an otherwise duplicate-free map (regression)', () => {
+      const projNoDup = path.join(ROOT, 'projects', 'commit-nodupe-app');
+      fs.mkdirSync(path.join(projNoDup, '.membridge'), { recursive: true });
+      const r1 = { sha: 'n1', ts: 't1', project: projNoDup, sessions: [{ session: 'w1', files: ['a.js'] }], unattributed: [] };
+      const r2 = { sha: 'n2', ts: 't2', project: projNoDup, sessions: [], unattributed: ['b.js'] };
+      commits.recordCommit(projNoDup, r1);
+      commits.recordCommit(projNoDup, r2);
+      assert.deepStrictEqual(commits.loadCommitMap(projNoDup), [r1, r2]);
+    });
+
     // Backfill through the real syncOnce over a real repo (git init prior
     // art: the auto-link and gitignore tests above). Events are planted a
     // minute in the past so they predate the commits made now.
