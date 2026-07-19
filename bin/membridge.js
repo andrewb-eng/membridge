@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 'use strict';
-// Fast path: the Claude Code Stop hook fires on every session stop and must
-// not pay for the full CLI require tree below (server, dashboard, team sync).
-if (process.argv[2] === 'hook' && process.argv[3] === 'stop') {
-  require('../lib/hooks').runStop();
+// Fast path: the Claude Code Stop hook fires on every session stop and the
+// git post-commit hook on every commit — neither may pay for the full CLI
+// require tree below (server, dashboard, team sync).
+if (process.argv[2] === 'hook' && (process.argv[3] === 'stop' || process.argv[3] === 'post-commit')) {
+  const hooks = require('../lib/hooks');
+  (process.argv[3] === 'stop' ? hooks.runStop : hooks.runPostCommit)();
   return;
 }
 const fs = require('fs');
@@ -283,31 +285,23 @@ function cmdWhy() {
   const config = util.getConfig();
   const projectResolve = require('../lib/project-resolve');
   const provenance = require('../lib/provenance');
-  // Shell cwd is realpath'd by node, while project keys come from tool logs
-  // and may spell the same directory through a symlink (macOS /var ->
-  // /private/var, symlinked homes). Track BOTH spellings of every key and
-  // map whichever one the walk finds back to the state key. The file itself
-  // may not exist (a deleted file's history is still a fair question), so
-  // only its parent directory is realpath'd, and only best-effort.
+  // Shell cwd is realpath'd by node while project keys keep the tool-log
+  // spelling; resolveTrackedKey matches both spellings (it's the same logic
+  // the git post-commit hook uses). The file itself may not exist (a deleted
+  // file's history is still a fair question), so only its parent directory
+  // is realpath'd, and only best-effort.
   let abs = path.resolve(process.cwd(), fileArg);
   try {
     abs = path.join(fs.realpathSync(path.dirname(abs)), path.basename(abs));
   } catch {}
-  const trackedKeys = new Map();
-  for (const k of Object.keys(state.projects || {})) {
-    trackedKeys.set(util.normPath(k), k);
-    try {
-      trackedKeys.set(util.normPath(fs.realpathSync(k)), k);
-    } catch {}
-  }
-  const root = projectResolve.resolveRoot(abs, new Set(trackedKeys.keys()));
-  const key = root && (trackedKeys.get(util.normPath(root)) || findProjectKey(state, root));
-  if (!key) die(`${fileArg} is not inside a tracked project — no MemBridge activity recorded there.`);
-  // Relativize against `root` (the spelling the walk matched, an ancestor of
-  // abs) and hand fileProvenance the RELATIVE path — relative paths are
+  const hit = projectResolve.resolveTrackedKey(state, abs);
+  if (!hit) die(`${fileArg} is not inside a tracked project — no MemBridge activity recorded there.`);
+  // Relativize against hit.root (the spelling the walk matched, an ancestor
+  // of abs) and hand fileProvenance the RELATIVE path — relative paths are
   // spelling-independent, so the key's own spelling no longer matters.
-  const rel = provenance.normalizeRel(root, abs);
+  const rel = provenance.normalizeRel(hit.root, abs);
   if (!rel) die(`${fileArg} is not inside a tracked project — no MemBridge activity recorded there.`);
+  const key = hit.key;
   const rows = provenance.fileProvenance(key, state.projects[key], config, rel);
   if (!rows.length) {
     console.log(`No recorded AI edits for ${rel} in ${key}.`);
@@ -541,7 +535,8 @@ async function cmdTeam() {
 function cmdHook() {
   const sub = args[1];
   if (sub === 'stop') return hooks.runStop();
-  die('Usage: membridge hook stop  (invoked by the Claude Code Stop hook — see `membridge setup-hooks`)');
+  if (sub === 'post-commit') return hooks.runPostCommit();
+  die('Usage: membridge hook <stop|post-commit>  (invoked by the installed hooks — see `membridge setup-hooks`)');
 }
 
 function cmdHelp() {
@@ -568,10 +563,12 @@ Usage: membridge <command>
   help                this text
 
 Distillation (agent-written session summaries — see README):
-  setup-hooks         add a Claude Code Stop hook: the agent that did the work
-                      writes a 2-3 line summary before each session ends
-  remove-hooks        remove the MemBridge Stop hook (your other hooks are kept)
-  hook stop           the hook itself (invoked by Claude Code, not by you)
+  setup-hooks         add a Claude Code Stop hook (agent-written session
+                      summaries) AND a git post-commit hook in every tracked
+                      repo (instant commit->session provenance capture)
+  remove-hooks        remove the MemBridge hooks (your other hooks are kept)
+  hook stop           the Stop hook itself (invoked by Claude Code, not by you)
+  hook post-commit    the git hook itself (invoked by git, not by you)
 
 MCP (expose project memory, read-only, to MCP-capable clients — Claude
 Desktop, Cursor, Cowork, ...; see README):

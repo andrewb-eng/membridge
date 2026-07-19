@@ -4655,6 +4655,446 @@ async function main() {
     }
   }
 
+  // --- 16. Commit↔session attribution (lib/commits.js, provenance Phase 2) ---
+  // Pure fixtures — no git, no wall clock. Events carry ABSOLUTE file paths
+  // (as the real stream does) and are normalized against opts.projectPath;
+  // changed files arrive repo-relative (as git reports them).
+  {
+    const projC = path.join(ROOT, 'projects', 'commits-app');
+    const editEv = (session, ts, rel) =>
+      ({ ts, source: 'Claude Code', kind: 'edit', file: path.join(projC, rel), session });
+    const commitEvts = [
+      editEv('sA', '2026-07-18T10:00:00.000Z', 'src/a.js'),
+      editEv('sA', '2026-07-18T10:01:00.000Z', 'src/b.js'),
+      editEv('sB', '2026-07-18T10:05:00.000Z', 'src/b.js'),
+      editEv('sB', '2026-07-18T10:06:00.000Z', 'src/c.js'),
+      { ts: '2026-07-18T10:07:00.000Z', source: 'Claude Code', kind: 'prompt', text: 'noise', session: 'sB' },
+      editEv('', '2026-07-18T10:08:00.000Z', 'docs/orphan.md'),
+      editEv('sC', '2026-07-18T11:30:00.000Z', 'src/a.js'), // after the commit
+    ];
+    const COMMIT_TS = '2026-07-18T11:00:00.000Z';
+    const cOpts = { projectPath: projC };
+
+    let commits = null;
+    check('commits: one session that edited every changed file owns them all', () => {
+      commits = require('../lib/commits');
+      const soloEvts = [
+        editEv('sA', '2026-07-18T10:00:00.000Z', 'src/a.js'),
+        editEv('sA', '2026-07-18T10:01:00.000Z', 'src/b.js'),
+      ];
+      const res = commits.attributeCommit(['src/a.js', 'src/b.js'], COMMIT_TS, soloEvts, cOpts);
+      assert.deepStrictEqual(res, {
+        sessions: [{ session: 'sA', files: ['src/a.js', 'src/b.js'] }],
+        unattributed: [],
+      });
+      // ms-epoch commit time is accepted and equivalent
+      const resMs = commits.attributeCommit(['src/a.js', 'src/b.js'], Date.parse(COMMIT_TS), soloEvts, cOpts);
+      assert.deepStrictEqual(resMs, res);
+    });
+
+    check('commits: files split across the sessions that own them, newest-owning session first', () => {
+      assert.ok(commits, 'lib/commits.js missing');
+      const res = commits.attributeCommit(['src/a.js', 'src/c.js'], COMMIT_TS, commitEvts, cOpts);
+      assert.deepStrictEqual(res.sessions, [
+        { session: 'sB', files: ['src/c.js'] },     // last edit 10:06 — newest first
+        { session: 'sA', files: ['src/a.js'] },     // last edit 10:00
+      ]);
+      assert.deepStrictEqual(res.unattributed, []);
+    });
+
+    check('commits: when two sessions edited the same file before the commit, the most recent wins', () => {
+      assert.ok(commits, 'lib/commits.js missing');
+      const res = commits.attributeCommit(['src/b.js'], COMMIT_TS, commitEvts, cOpts);
+      assert.deepStrictEqual(res.sessions, [{ session: 'sB', files: ['src/b.js'] }]);
+    });
+
+    check('commits: a changed file with no qualifying edit — or only a sessionless one — is unattributed', () => {
+      assert.ok(commits, 'lib/commits.js missing');
+      const res = commits.attributeCommit(['src/zzz.js', 'docs/orphan.md'], COMMIT_TS, commitEvts, cOpts);
+      assert.deepStrictEqual(res.sessions, []);
+      assert.deepStrictEqual(res.unattributed, ['src/zzz.js', 'docs/orphan.md']);
+    });
+
+    check('commits: edits dated after the commit never attribute', () => {
+      assert.ok(commits, 'lib/commits.js missing');
+      // At 11:00, sC's 11:30 edit of a.js must not steal ownership from sA…
+      const late = commits.attributeCommit(['src/a.js'], COMMIT_TS, commitEvts, cOpts);
+      assert.deepStrictEqual(late.sessions, [{ session: 'sA', files: ['src/a.js'] }]);
+      // …and with a commit time before every edit, nothing qualifies at all.
+      const early = commits.attributeCommit(['src/a.js'], '2026-07-18T09:00:00.000Z', commitEvts, cOpts);
+      assert.deepStrictEqual(early.sessions, []);
+      assert.deepStrictEqual(early.unattributed, ['src/a.js']);
+    });
+
+    check('commits: absolute and ./-prefixed changed-file spellings normalize and still match', () => {
+      assert.ok(commits, 'lib/commits.js missing');
+      const res = commits.attributeCommit(
+        ['./src/a.js', path.join(projC, 'src', 'b.js')], COMMIT_TS, commitEvts, cOpts);
+      const owned = res.sessions.flatMap(s => s.files).sort();
+      assert.deepStrictEqual(owned, ['src/a.js', 'src/b.js'], 'both spellings must normalize to repo-relative and match');
+      assert.deepStrictEqual(res.unattributed, []);
+    });
+
+    // --- Phase 2 Task 2: the git commit reader, injected runGit only -------
+    // Canned git output, no real repo. The fake records every args array so
+    // tests can pin WHICH git commands run (the -n 50 cap, the ranges).
+    const mkGit = handler => {
+      const calls = [];
+      return { calls, deps: { runGit: args => { calls.push(args); return handler(args); } } };
+    };
+
+    check('commits: readCommit parses committer ts and changed files from git show --numstat', () => {
+      assert.ok(commits && commits.readCommit, 'readCommit missing');
+      // Real shape of `git show --numstat --format=%cI|%P`: the format line
+      // (date|parents), a blank line, then numstat rows.
+      const g = mkGit(() => '2026-07-18T14:00:00+02:00|p0000aa\n\n3\t1\tsrc/a.js\n10\t0\tsrc/b.js\n');
+      const res = commits.readCommit(projC, 'abc1234', g.deps);
+      assert.deepStrictEqual(res, {
+        sha: 'abc1234',
+        ts: '2026-07-18T14:00:00+02:00',
+        files: ['src/a.js', 'src/b.js'],
+      });
+      assert.strictEqual(g.calls.length, 1);
+      assert.ok(g.calls[0].includes('abc1234'), 'sha missing from the git invocation');
+      assert.ok(g.calls[0].includes('--no-show-signature'),
+        'must pass --no-show-signature: log.showSignature=true would otherwise prepend signature text to stdout and corrupt ts');
+      assert.ok(g.calls[0].some(a => a.includes('%cI|%P')), 'format must carry the parent list for merge detection');
+    });
+
+    check('commits: readCommit unquotes a C-quoted spaced path and decodes octal UTF-8 bytes', () => {
+      assert.ok(commits && commits.readCommit, 'readCommit missing');
+      const g = mkGit(() => '2026-07-18T14:00:00Z|p0000aa\n\n2\t0\t"docs/read me.md"\n1\t0\t"\\303\\244.txt"\n');
+      const res = commits.readCommit(projC, 'beef111', g.deps);
+      assert.deepStrictEqual(res.files, ['docs/read me.md', 'ä.txt'],
+        'octal escapes are UTF-8 bytes, not Latin-1 chars');
+      // the shared changes.js helper is the thing that decodes
+      assert.strictEqual(changesLib.unquote('"\\303\\244.txt"'), 'ä.txt');
+      assert.strictEqual(changesLib.unquote('plain.js'), 'plain.js');
+    });
+
+    check('commits: readCommit on a merge returns empty files even though git prints first-parent numstat rows', () => {
+      assert.ok(commits && commits.readCommit, 'readCommit missing');
+      // Modern git (>=2.31) DOES print numstat rows for merges (first-parent
+      // diff) — verified on this repo. The merge contract must therefore be
+      // enforced from the parent list, never inferred from empty output.
+      const merge = commits.readCommit(projC, 'mmm2222',
+        mkGit(() => '2026-07-18T15:00:00Z|p0000aa p0000bb\n\n748\t0\tdocs/upstream.md\n12\t3\tlib/other.js\n').deps);
+      assert.deepStrictEqual(merge, { sha: 'mmm2222', ts: '2026-07-18T15:00:00Z', files: [] });
+      const broken = commits.readCommit(projC, 'eee3333',
+        mkGit(() => { throw new Error('fatal: bad object'); }).deps);
+      assert.deepStrictEqual(broken, { sha: 'eee3333', ts: null, files: [] });
+    });
+
+    check('commits: newCommitsSince returns post-cursor commits oldest-first, excluding merges', () => {
+      assert.ok(commits && commits.newCommitsSince, 'newCommitsSince missing');
+      const g = mkGit(args => {
+        if (args.includes('merge-base')) return ''; // ancestor check passes
+        return 'c3new\nc2mid\nc1old\n';             // git log: newest first
+      });
+      const res = commits.newCommitsSince(projC, 'cursor99', g.deps);
+      assert.deepStrictEqual(res, ['c1old', 'c2mid', 'c3new'], 'must be oldest-first');
+      const logCall = g.calls.find(a => a.includes('log'));
+      assert.ok(logCall, 'expected a git log call');
+      assert.ok(logCall.includes('--no-merges'), 'merges must be excluded');
+      assert.ok(logCall.some(a => a === 'cursor99..HEAD'), 'expected the sinceSha..HEAD range');
+    });
+
+    check('commits: first run (no cursor) is capped at the last 50 commits, never the whole history', () => {
+      assert.ok(commits && commits.newCommitsSince, 'newCommitsSince missing');
+      const g = mkGit(() => 'n2\nn1\n');
+      const res = commits.newCommitsSince(projC, null, g.deps);
+      assert.deepStrictEqual(res, ['n1', 'n2']);
+      const logCall = g.calls.find(a => a.includes('log'));
+      assert.ok(logCall.includes('-n') && logCall.includes('50'), `expected -n 50, got: ${logCall}`);
+      assert.ok(!logCall.some(a => a.includes('..')), 'first run must not use a range');
+      // An unknown / non-ancestor cursor falls back to the SAME bounded run.
+      const g2 = mkGit(args => {
+        if (args.includes('merge-base')) throw new Error('not an ancestor');
+        return 'n2\nn1\n';
+      });
+      const res2 = commits.newCommitsSince(projC, 'gone000', g2.deps);
+      assert.deepStrictEqual(res2, ['n1', 'n2']);
+      const log2 = g2.calls.find(a => a.includes('log'));
+      assert.ok(log2.includes('-n') && log2.includes('50'), 'bad cursor must fall back to the bounded first run');
+    });
+
+    check('commits: any git failure in newCommitsSince returns [], never throws', () => {
+      assert.ok(commits && commits.newCommitsSince, 'newCommitsSince missing');
+      const dead = mkGit(() => { throw new Error('fatal: not a git repository'); });
+      assert.deepStrictEqual(commits.newCommitsSince(projC, null, dead.deps), []);
+      assert.deepStrictEqual(commits.newCommitsSince(projC, 'cursor99', dead.deps), []);
+    });
+
+    // --- Phase 2 Task 3: persist the map + populate during sync ------------
+
+    check('commits: recordCommit/loadCommitMap round-trip skips garbage lines; lastRecordedSha is the newest', () => {
+      assert.ok(commits && commits.recordCommit, 'recordCommit missing');
+      const projStore = path.join(ROOT, 'projects', 'commit-store-app');
+      fs.mkdirSync(projStore, { recursive: true });
+      const rec1 = { sha: 's1', ts: 't1', project: projStore, sessions: [{ session: 'w1', files: ['a.js'] }], unattributed: [] };
+      const rec2 = { sha: 's2', ts: 't2', project: projStore, sessions: [], unattributed: ['b.js'] };
+      commits.recordCommit(projStore, rec1);
+      fs.appendFileSync(path.join(projStore, '.membridge', 'commits.jsonl'), 'NOT JSON {{{\n');
+      commits.recordCommit(projStore, rec2);
+      assert.deepStrictEqual(commits.loadCommitMap(projStore), [rec1, rec2], 'round trip with garbage line skipped');
+      assert.strictEqual(commits.lastRecordedSha(projStore), 's2');
+      const nowhere = path.join(ROOT, 'projects', 'no-such-app');
+      assert.deepStrictEqual(commits.loadCommitMap(nowhere), []);
+      assert.strictEqual(commits.lastRecordedSha(nowhere), null);
+    });
+
+    check('commits: recordCommit lands on a fresh line after a torn (newline-less) tail instead of gluing', () => {
+      assert.ok(commits && commits.recordCommit, 'recordCommit missing');
+      const projTorn = path.join(ROOT, 'projects', 'commit-torn-app');
+      fs.mkdirSync(path.join(projTorn, '.membridge'), { recursive: true });
+      // A crash/ENOSPC mid-append leaves a partial line with no trailing \n.
+      fs.writeFileSync(path.join(projTorn, '.membridge', 'commits.jsonl'), '{"sha":"aaa","ts":"2026-0');
+      const rec = { sha: 'bbb', ts: 't', project: projTorn, sessions: [], unattributed: [] };
+      commits.recordCommit(projTorn, rec);
+      assert.deepStrictEqual(commits.loadCommitMap(projTorn), [rec],
+        'the healthy record must survive beside the torn line, not be glued into it');
+      assert.strictEqual(commits.lastRecordedSha(projTorn), 'bbb');
+    });
+
+    // Backfill through the real syncOnce over a real repo (git init prior
+    // art: the auto-link and gitignore tests above). Events are planted a
+    // minute in the past so they predate the commits made now.
+    {
+      const projCap = path.join(ROOT, 'projects', 'commit-cap-app');
+      fs.mkdirSync(path.join(projCap, 'src'), { recursive: true });
+      const gitCap = args => spawnSync('git',
+        ['-C', projCap, '-c', 'user.email=t@t.t', '-c', 'user.name=T', ...args],
+        { encoding: 'utf8' });
+      gitCap(['init', '-q']);
+      const past = ms => new Date(Date.now() - ms).toISOString();
+      {
+        const st = util.loadState();
+        st.projects[projCap] = { events: [
+          { ts: past(120000), source: 'Claude Code', kind: 'edit', file: path.join(projCap, 'src', 'one.js'), session: 'cap1' },
+          { ts: past(60000), source: 'Codex', kind: 'edit', file: path.join(projCap, 'src', 'two.js'), session: 'cap2' },
+        ] };
+        util.saveState(st);
+      }
+      fs.writeFileSync(path.join(projCap, 'src', 'one.js'), 'one\n');
+      gitCap(['add', '-A']);
+      gitCap(['commit', '-q', '-m', 'c1']);
+      const sha1 = gitCap(['rev-parse', 'HEAD']).stdout.trim();
+      syncOnce({ project: projCap });
+
+      check('commits: syncOnce backfills a new commit with attribution and advances the cursor', () => {
+        const commitsMod = require('../lib/commits');
+        const map = commitsMod.loadCommitMap(projCap);
+        assert.strictEqual(map.length, 1, `expected 1 record, got ${JSON.stringify(map)}`);
+        assert.strictEqual(map[0].sha, sha1);
+        assert.ok(map[0].ts, 'record missing commit ts');
+        assert.deepStrictEqual(map[0].sessions, [{ session: 'cap1', files: ['src/one.js'] }]);
+        assert.deepStrictEqual(map[0].unattributed, []);
+        assert.strictEqual(util.loadState().projects[projCap].lastCommitSha, sha1, 'cursor not advanced');
+      });
+
+      fs.writeFileSync(path.join(projCap, 'src', 'two.js'), 'two\n');
+      gitCap(['add', '-A']);
+      gitCap(['commit', '-q', '-m', 'c2']);
+      const sha2 = gitCap(['rev-parse', 'HEAD']).stdout.trim();
+      syncOnce({ project: projCap });
+      syncOnce({ project: projCap }); // and once more with nothing new
+
+      check('commits: a second sync appends only the new commit; a third adds nothing (idempotent)', () => {
+        const commitsMod = require('../lib/commits');
+        const map = commitsMod.loadCommitMap(projCap);
+        assert.strictEqual(map.length, 2, `expected 2 records, got ${JSON.stringify(map.map(r => r.sha))}`);
+        assert.strictEqual(map[0].sha, sha1, 'first record must be untouched');
+        assert.strictEqual(map[1].sha, sha2);
+        assert.deepStrictEqual(map[1].sessions, [{ session: 'cap2', files: ['src/two.js'] }]);
+        assert.strictEqual(util.loadState().projects[projCap].lastCommitSha, sha2);
+      });
+
+      check('commits: a non-repo project leaves sync green with zero commit rows', () => {
+        syncOnce(); // full pass over every tracked project, incl. non-repos
+        assert.ok(!fs.existsSync(path.join(proj1, '.membridge', 'commits.jsonl')),
+          'a project without a git repo must get no commit map');
+      });
+
+      // --- Phase 2 Task 4: instant capture via the git post-commit hook ----
+      {
+        const st = util.loadState();
+        st.projects[projCap].events.push(
+          { ts: past(30000), source: 'Claude Code', kind: 'edit', file: path.join(projCap, 'src', 'three.js'), session: 'cap3' });
+        util.saveState(st);
+      }
+      fs.writeFileSync(path.join(projCap, 'src', 'three.js'), 'three\n');
+      gitCap(['add', '-A']);
+      gitCap(['commit', '-q', '-m', 'c3']);
+      const sha3 = gitCap(['rev-parse', 'HEAD']).stdout.trim();
+      const hookEnv = { ...process.env };
+      const hook1 = spawnSync(process.execPath, [BIN, 'hook', 'post-commit'], { cwd: projCap, env: hookEnv, encoding: 'utf8' });
+      const hook2 = spawnSync(process.execPath, [BIN, 'hook', 'post-commit'], { cwd: projCap, env: hookEnv, encoding: 'utf8' });
+
+      check('commits: `membridge hook post-commit` records HEAD once — second run is a no-op', () => {
+        assert.strictEqual(hook1.status, 0, `exit ${hook1.status}, stderr: ${hook1.stderr}`);
+        assert.strictEqual(hook1.stdout, '', 'a git hook must be silent');
+        assert.strictEqual(hook2.status, 0);
+        const commitsMod = require('../lib/commits');
+        const map = commitsMod.loadCommitMap(projCap);
+        assert.strictEqual(map.length, 3, `expected 3 records, got ${JSON.stringify(map.map(r => r.sha))}`);
+        assert.strictEqual(map[2].sha, sha3);
+        assert.deepStrictEqual(map[2].sessions, [{ session: 'cap3', files: ['src/three.js'] }]);
+      });
+
+      check('commits: daemon sync after the hook adds no duplicate and advances the cursor over it', () => {
+        syncOnce({ project: projCap });
+        const commitsMod = require('../lib/commits');
+        assert.strictEqual(commitsMod.loadCommitMap(projCap).length, 3, 'sync duplicated a hook-recorded commit');
+        assert.strictEqual(util.loadState().projects[projCap].lastCommitSha, sha3, 'cursor must advance over hook-recorded shas');
+      });
+
+      check('commits: hook outside a tracked project exits 0, silent, records nothing', () => {
+        const stray = fs.mkdtempSync(path.join(os.tmpdir(), 'mb-stray-'));
+        spawnSync('git', ['-C', stray, 'init', '-q'], { encoding: 'utf8' });
+        const out = spawnSync(process.execPath, [BIN, 'hook', 'post-commit'], { cwd: stray, env: hookEnv, encoding: 'utf8' });
+        assert.strictEqual(out.status, 0, `exit ${out.status}, stderr: ${out.stderr}`);
+        assert.strictEqual(out.stdout, '', 'must be silent outside a tracked project');
+        assert.ok(!fs.existsSync(path.join(stray, '.membridge')), 'stray repo must get no .membridge');
+      });
+
+      // Install/remove, mirroring the Stop-hook safety: fresh settings file,
+      // one repo with a pre-existing user hook (projCap), one bare tracked
+      // repo (projHook) that gets a fresh membridge-only hook file.
+      const projHook = path.join(ROOT, 'projects', 'hook-app');
+      fs.mkdirSync(projHook, { recursive: true });
+      spawnSync('git', ['-C', projHook, 'init', '-q'], { encoding: 'utf8' });
+      {
+        const st = util.loadState();
+        st.projects[projHook] = { events: [] };
+        util.saveState(st);
+      }
+      const userHook = '#!/bin/sh\necho user-post-commit\n';
+      fs.mkdirSync(path.join(projCap, '.git', 'hooks'), { recursive: true });
+      fs.writeFileSync(path.join(projCap, '.git', 'hooks', 'post-commit'), userHook);
+      const pcSettings = path.join(ROOT, 'claude-settings-pc.json');
+      const envPc = { ...process.env, MEMBRIDGE_CLAUDE_SETTINGS: pcSettings };
+      const pcSetup1 = spawnSync(process.execPath, [BIN, 'setup-hooks'], { env: envPc, encoding: 'utf8' });
+      const pcSetup2 = spawnSync(process.execPath, [BIN, 'setup-hooks'], { env: envPc, encoding: 'utf8' });
+
+      check('commits: setup-hooks installs an executable post-commit hook with the absolute command', () => {
+        assert.strictEqual(pcSetup1.status, 0, pcSetup1.stderr);
+        const f = path.join(projHook, '.git', 'hooks', 'post-commit');
+        assert.ok(fs.existsSync(f), 'post-commit hook not written to a tracked repo');
+        const body = read(f);
+        assert.ok(body.startsWith('#!/bin/sh'), 'fresh hook file needs a shebang');
+        assert.ok(body.includes('membridge-hook.js') && body.includes('post-commit'), `hook body: ${body}`);
+        assert.ok(body.includes(`"${process.execPath}"`), 'command must be absolute (quoted runtime binary)');
+        if (process.platform !== 'win32') {
+          assert.ok(fs.statSync(f).mode & 0o111, 'hook file not executable');
+        }
+      });
+
+      check('commits: setup-hooks preserves an existing user post-commit byte-for-byte and never duplicates', () => {
+        assert.strictEqual(pcSetup2.status, 0, pcSetup2.stderr);
+        const body = read(path.join(projCap, '.git', 'hooks', 'post-commit'));
+        assert.ok(body.startsWith(userHook), 'user hook bytes changed');
+        assert.strictEqual(count(body, 'membridge-hook.js'), 1, 'membridge line missing or duplicated across two setup runs');
+      });
+
+      const pcRemove = spawnSync(process.execPath, [BIN, 'remove-hooks'], { env: envPc, encoding: 'utf8' });
+      check('commits: remove-hooks strips only the membridge line; a membridge-only hook file is deleted', () => {
+        assert.strictEqual(pcRemove.status, 0, pcRemove.stderr);
+        assert.ok(/post-commit/.test(pcRemove.stdout), `remove-hooks must report the post-commit cleanup, said: ${pcRemove.stdout}`);
+        assert.strictEqual(read(path.join(projCap, '.git', 'hooks', 'post-commit')), userHook,
+          'user hook must be restored byte-for-byte');
+        assert.ok(!fs.existsSync(path.join(projHook, '.git', 'hooks', 'post-commit')),
+          'a hook file that was only ours must be deleted');
+      });
+
+      // A user hook whose OWN line mentions membridge (their script calling
+      // the CLI) is theirs: install must append, never replace it; remove
+      // must leave it untouched. Only lines invoking our shim are ours.
+      const userMb = '#!/bin/sh\nmembridge sync --project . &\n';
+      fs.writeFileSync(path.join(projHook, '.git', 'hooks', 'post-commit'), userMb);
+      const mbSetup = spawnSync(process.execPath, [BIN, 'setup-hooks'], { env: envPc, encoding: 'utf8' });
+      check('commits: a user hook line that merely mentions membridge is appended-to, never replaced', () => {
+        assert.strictEqual(mbSetup.status, 0, mbSetup.stderr);
+        const body = read(path.join(projHook, '.git', 'hooks', 'post-commit'));
+        assert.ok(body.startsWith(userMb), `user's membridge-mentioning line was replaced; body: ${body}`);
+        assert.ok(body.includes('membridge-hook.js'), 'our line must still be appended');
+      });
+      const mbRemove = spawnSync(process.execPath, [BIN, 'remove-hooks'], { env: envPc, encoding: 'utf8' });
+      check('commits: remove-hooks leaves a user line that merely mentions membridge intact', () => {
+        assert.strictEqual(mbRemove.status, 0, mbRemove.stderr);
+        assert.strictEqual(read(path.join(projHook, '.git', 'hooks', 'post-commit')), userMb,
+          'the user-owned membridge-mentioning line must survive removal');
+      });
+
+      // One unwritable hooks dir must not abort the whole install for every
+      // other repo (or block the Stop-hook settings write).
+      const projRo = path.join(ROOT, 'projects', 'ro-hook-app');
+      fs.mkdirSync(projRo, { recursive: true });
+      spawnSync('git', ['-C', projRo, 'init', '-q'], { encoding: 'utf8' });
+      {
+        const st = util.loadState();
+        st.projects[projRo] = { events: [] };
+        util.saveState(st);
+      }
+      fs.chmodSync(path.join(projRo, '.git', 'hooks'), 0o555);
+      const roSetup = spawnSync(process.execPath, [BIN, 'setup-hooks'], { env: envPc, encoding: 'utf8' });
+      fs.chmodSync(path.join(projRo, '.git', 'hooks'), 0o755);
+      check('commits: one unwritable hooks dir does not abort setup-hooks for the other repos', () => {
+        assert.strictEqual(roSetup.status, 0, `setup-hooks aborted: ${roSetup.stderr}`);
+        assert.ok(read(path.join(projHook, '.git', 'hooks', 'post-commit')).includes('membridge-hook.js'),
+          'healthy repos must still get their hook');
+        const settings = JSON.parse(read(pcSettings));
+        assert.ok((settings.hooks.Stop || []).length >= 1, 'the Stop hook settings write must still happen');
+      });
+
+      // A big backlog behind a VALID cursor drains in bounded per-pass slices
+      // (the first-run 50 cap alone does not cover this path), converging
+      // over passes instead of stalling one sync on hundreds of git calls.
+      const projMany = path.join(ROOT, 'projects', 'many-commits-app');
+      fs.mkdirSync(projMany, { recursive: true });
+      spawnSync('sh', ['-c',
+        `cd "${projMany}" && git init -q && git -c user.email=t@t.t -c user.name=T commit -q --allow-empty -m c0`],
+        { encoding: 'utf8' });
+      {
+        const st = util.loadState();
+        st.projects[projMany] = { events: [] };
+        util.saveState(st);
+      }
+      syncOnce({ project: projMany }); // cursor now at c0
+      spawnSync('sh', ['-c',
+        `cd "${projMany}" && for i in $(seq 1 54); do git -c user.email=t@t.t -c user.name=T commit -q --allow-empty -m c$i; done`],
+        { encoding: 'utf8' });
+      syncOnce({ project: projMany });
+      check('commits: a valid-cursor backlog is capped per pass and converges over passes', () => {
+        const commitsMod = require('../lib/commits');
+        assert.strictEqual(commitsMod.loadCommitMap(projMany).length, 51,
+          'second pass must record at most 50 new commits (1 + 50)');
+        syncOnce({ project: projMany });
+        assert.strictEqual(commitsMod.loadCommitMap(projMany).length, 55, 'third pass must drain the rest');
+        const head = spawnSync('git', ['-C', projMany, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+        assert.strictEqual(util.loadState().projects[projMany].lastCommitSha, head, 'cursor must converge to HEAD');
+      });
+
+      // Stale-state guard: state.json lags the daemon scan, so a commit whose
+      // files have no matching events yet must be DEFERRED to the daemon —
+      // recording a blind row would freeze it (recorded shas are never
+      // re-attributed).
+      spawnSync('sh', ['-c',
+        `cd "${projMany}" && echo x > later.js && git add later.js && git -c user.email=t@t.t -c user.name=T commit -q -m c55`],
+        { encoding: 'utf8' });
+      const deferRun = spawnSync(process.execPath, [BIN, 'hook', 'post-commit'], { cwd: projMany, env: hookEnv, encoding: 'utf8' });
+      check('commits: the hook defers an unattributable commit to the daemon instead of freezing an empty row', () => {
+        assert.strictEqual(deferRun.status, 0, deferRun.stderr);
+        const commitsMod = require('../lib/commits');
+        assert.strictEqual(commitsMod.loadCommitMap(projMany).length, 55,
+          'the hook must not record a row it cannot attribute');
+        syncOnce({ project: projMany });
+        const map = commitsMod.loadCommitMap(projMany);
+        assert.strictEqual(map.length, 56, 'the daemon must pick the deferred commit up');
+        assert.deepStrictEqual(map[55].unattributed, ['later.js'], 'daemon-recorded row carries the attribution result');
+      });
+    }
+  }
+
   check('project-resolve: resolveRoot returns nearest tracked ancestor, else null', () => {
     const base = fs.mkdtempSync(path.join(os.tmpdir(), 'mb-resolve-'));
     const repo = path.join(base, 'repo');
