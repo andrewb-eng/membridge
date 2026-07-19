@@ -5417,6 +5417,126 @@ async function main() {
     });
   }
 
+  // --- Phase 3 Task 3: churn — landed-vs-reverted diagnostic (local-only) ---
+  // Pure, injected: a fixture commit map + a fake runGit answering `git show
+  // --numstat` (additions per commit) and `git blame HEAD` (which HEAD lines
+  // still originate from the session's commits). No real repo, no wall clock,
+  // and — by design — NO author/teammate parameter anywhere in the signature.
+  {
+    const { churn } = require('../lib/churn');
+    const C1 = '1'.repeat(40), C2 = '2'.repeat(40), OTHER = '9'.repeat(40);
+    const DAY = 24 * 60 * 60 * 1000;
+    const NOW = Date.parse('2026-07-18T00:00:00Z');
+    const settledTs = new Date(NOW - 30 * DAY).toISOString(); // 30d old = settled
+    const recentTs = new Date(NOW - 1 * DAY).toISOString();   // 1d old = too recent
+    // A porcelain blame block: one header line per source line, sha first.
+    const blame = shas => shas.map((s, i) => `${s} ${i + 1} ${i + 1} 1\nauthor X\ncommitter X\n\tcode ${i}\n`).join('');
+    const mapSettled = [
+      { sha: C1, ts: settledTs, project: '/repo', sessions: [{ session: 'S', files: ['a.js'] }], unattributed: [] },
+      { sha: C2, ts: settledTs, project: '/repo', sessions: [{ session: 'S', files: ['b.js'] }], unattributed: [] },
+    ];
+    const numstat = { [C1]: '10\t0\ta.js\n', [C2]: '6\t0\tb.js\n' };
+    const blameByFile = {
+      'a.js': blame([...Array(7).fill(C1), OTHER]), // 7 of 10 introduced lines survive
+      'b.js': blame(Array(6).fill(C2)),             // all 6 survive
+    };
+    const mkRun = () => {
+      const calls = [];
+      const runGit = args => {
+        calls.push(args);
+        if (args[0] === 'show') {
+          const sha = args.find(a => /^[0-9a-f]{40}$/.test(a));
+          return numstat[sha] || '';
+        }
+        if (args[0] === 'blame') return blameByFile[args[args.length - 1]] || '';
+        throw new Error(`unexpected git ${args.join(' ')}`);
+      };
+      return { calls, runGit };
+    };
+
+    check('churn: landed-vs-written is computed from numstat additions and HEAD blame survival', () => {
+      const { runGit } = mkRun();
+      const res = churn('/repo', { session: 'S', sinceDays: 7, now: NOW }, { loadCommitMap: () => mapSettled, runGit });
+      assert.strictEqual(res.status, 'ok', `status: ${res.status}`);
+      assert.strictEqual(res.written, 16, 'written = 10 + 6 additions');
+      assert.strictEqual(res.landed, 13, 'landed = 7 (a.js) + 6 (b.js) surviving lines');
+      assert.ok(Math.abs(res.fraction - 13 / 16) < 1e-9, `fraction: ${res.fraction}`);
+      assert.strictEqual(res.commits, 2, 'two settled commits evaluated');
+    });
+
+    check('churn: a session whose commits are all within the window is too-recent (not yet judgeable)', () => {
+      const recentMap = mapSettled.map(r => ({ ...r, ts: recentTs }));
+      const res = churn('/repo', { session: 'S', sinceDays: 7, now: NOW }, { loadCommitMap: () => recentMap, runGit: mkRun().runGit });
+      assert.strictEqual(res.status, 'too-recent');
+      assert.strictEqual(res.fraction, null);
+    });
+
+    check('churn: an empty commit set is insufficient, never a divide-by-zero', () => {
+      const res = churn('/repo', { session: 'ghost', sinceDays: 7, now: NOW }, { loadCommitMap: () => mapSettled, runGit: mkRun().runGit });
+      assert.strictEqual(res.status, 'insufficient');
+      assert.strictEqual(res.fraction, null);
+      assert.strictEqual(res.written, 0);
+    });
+
+    check('churn: any git failure degrades to unavailable and never throws', () => {
+      const dead = () => { throw new Error('fatal: not a git repository'); };
+      let res;
+      assert.doesNotThrow(() => { res = churn('/repo', { session: 'S', sinceDays: 7, now: NOW }, { loadCommitMap: () => mapSettled, runGit: dead }); });
+      assert.strictEqual(res.status, 'unavailable');
+      assert.strictEqual(res.fraction, null);
+    });
+
+    check('churn: has no author/teammate parameter — cross-person input is impossible by construction', () => {
+      // The signature is churn(projectPath, {session, sinceDays, now}, deps):
+      // an author-like option is simply not read, so it can never scope results.
+      const { runGit } = mkRun();
+      const base = churn('/repo', { session: 'S', sinceDays: 7, now: NOW }, { loadCommitMap: () => mapSettled, runGit });
+      const withAuthor = churn('/repo', { session: 'S', sinceDays: 7, now: NOW, author: 'marco', teammate: 'x' }, { loadCommitMap: () => mapSettled, runGit: mkRun().runGit });
+      assert.deepStrictEqual(withAuthor, base, 'an author/teammate option must be ignored, not honored');
+      assert.ok(!('author' in base) && !('who' in base), 'the churn result exposes no person dimension');
+    });
+
+    // --- Phase 3 Task 3: churn CLI renderer + wiring -----------------------
+    const churnLib = require('../lib/churn');
+    check('churn: parseSince reads "7d"/bare numbers and defaults to 7 days', () => {
+      assert.strictEqual(churnLib.parseSince('7d'), 7);
+      assert.strictEqual(churnLib.parseSince('30d'), 30);
+      assert.strictEqual(churnLib.parseSince('14'), 14);
+      assert.strictEqual(churnLib.parseSince(null), 7);
+      assert.strictEqual(churnLib.parseSince('garbage'), 7);
+    });
+
+    const CAVEAT_RE = /diagnostic.*not a target|never compared across (people|teammates)/i;
+    check('churn: renderChurn always ships the fixed caveat, and shows numbers only when ok', () => {
+      assert.ok(churnLib.renderChurn, 'renderChurn missing');
+      const ok = churnLib.renderChurn({ commits: 2, written: 16, landed: 13, fraction: 13 / 16, status: 'ok' }, { session: 'S', sinceDays: 7 });
+      assert.ok(/16/.test(ok) && /13/.test(ok), `ok render must show written/landed: ${ok}`);
+      assert.ok(/8[01]%|0\.8/.test(ok), `ok render must show the fraction: ${ok}`);
+      assert.ok(CAVEAT_RE.test(ok), `caveat missing from ok render: ${ok}`);
+      assert.ok(/approximate/i.test(ok), `pre-gate approximate note missing: ${ok}`);
+      for (const status of ['too-recent', 'insufficient', 'unavailable']) {
+        const out = churnLib.renderChurn({ commits: 0, written: 0, landed: 0, fraction: null, status }, { session: 'S', sinceDays: 7 });
+        assert.ok(CAVEAT_RE.test(out), `caveat missing from ${status} render: ${out}`);
+        assert.ok(out.length > 0 && !/NaN|undefined/.test(out), `${status} render must be an honest message: ${out}`);
+      }
+    });
+
+    // CLI wiring: real spawn. churn over projWhy (a tracked non-repo) degrades
+    // to 'unavailable' but must still exit 0 and print the caveat; an author-
+    // like flag must be REJECTED rather than silently scoping to a teammate.
+    const churnRun = spawnSync(process.execPath, [BIN, 'churn'], { cwd: proj1, encoding: 'utf8', env: process.env });
+    check('churn: `membridge churn` exits 0 and always prints the diagnostic caveat', () => {
+      assert.strictEqual(churnRun.status, 0, `exit ${churnRun.status}, stderr: ${churnRun.stderr}`);
+      assert.ok(CAVEAT_RE.test(churnRun.stdout), `caveat missing from CLI: ${churnRun.stdout}`);
+    });
+    const churnBad = spawnSync(process.execPath, [BIN, 'churn', '--teammate', 'marco'], { cwd: proj1, encoding: 'utf8', env: process.env });
+    check('churn: an author/teammate-like flag is rejected, never honored', () => {
+      assert.notStrictEqual(churnBad.status, 0, 'churn must reject an unknown per-person flag');
+      assert.ok(/no.*(per-person|teammate|author)|unknown option/i.test(churnBad.stderr + churnBad.stdout),
+        `expected a rejection message, got: ${churnBad.stderr}${churnBad.stdout}`);
+    });
+  }
+
   check('project-resolve: resolveRoot returns nearest tracked ancestor, else null', () => {
     const base = fs.mkdtempSync(path.join(os.tmpdir(), 'mb-resolve-'));
     const repo = path.join(base, 'repo');

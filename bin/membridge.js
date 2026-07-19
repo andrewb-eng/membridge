@@ -354,6 +354,42 @@ function cmdWhy() {
   renderRow(res.session);
 }
 
+// `membridge churn [--session <id>] [--since <Nd>] [--project <path>]` — the
+// diagnostic-only landed-vs-reverted view. There is DELIBERATELY no per-person
+// option: an unknown flag is rejected rather than silently scoped to anyone.
+function cmdChurn() {
+  const churnLib = require('../lib/churn');
+  const projectResolve = require('../lib/project-resolve');
+  const ALLOWED = new Set(['--session', '--since', '--project']);
+  for (let i = 1; i < args.length; i++) {
+    const a = args[i];
+    if (!a.startsWith('--')) continue;
+    if (!ALLOWED.has(a)) {
+      die(`Unknown option "${a}". churn takes only --session <id>, --since <Nd>, --project <path>. It has no per-person/teammate/author option by design — churn is never compared across people.`);
+    }
+    i++; // skip the flag's value
+  }
+  const state = util.loadState();
+  const projectArg = opt('--project');
+  const base = projectArg ? path.resolve(process.cwd(), projectArg) : process.cwd();
+  let abs = base;
+  try { abs = fs.realpathSync(base); } catch {}
+  // resolveTrackedKey walks up from a file's dirname — probe with a child.
+  const hit = projectResolve.resolveTrackedKey(state, path.join(abs, '_'));
+  if (!hit) die(`${base} is not inside a tracked project — no MemBridge commits recorded there.`);
+  const key = hit.key;
+  const proj = state.projects[key] || { events: [] };
+
+  const sinceGiven = opt('--since');
+  const sinceDays = churnLib.parseSince(sinceGiven);
+  let session = opt('--session');
+  // Bare invocation defaults to the current/most-recent session; an explicit
+  // --since (window) mode spans every locally-attributed commit instead.
+  if (!session && !sinceGiven) session = churnLib.mostRecentSession(proj);
+  const result = churnLib.churn(key, { session: session || null, sinceDays, now: Date.now() });
+  console.log(churnLib.renderChurn(result, { session: session || null, sinceDays }));
+}
+
 // ---------------------------------------------------------------------------
 // Team sync commands (Supabase backend, see supabase/schema.sql + README)
 // ---------------------------------------------------------------------------
@@ -591,13 +627,19 @@ Usage: membridge <command>
   dashboard           open the local web dashboard (starts daemon if needed)
   sync [--dry-run] [--project <path>]   one sync pass right now
   scan                read-only: show which tools/projects were discovered
-  why <file>[:<line>] which AI sessions edited this file, newest first; add
-                      :<line> for the one session behind a single line
   remove [--project <path>]             strip injected memory blocks
   enable-autostart    launch MemBridge automatically at login
   disable-autostart   remove the login launcher
   daemon              run in the foreground (used internally / by services)
   help                this text
+
+Provenance (why a file/line looks the way it does — see README):
+  why <file>[:<line>] which AI sessions edited this file, newest first; add
+                      :<line> for the one session behind a single line
+  churn [--session <id>] [--since <Nd>] [--project <path>]
+                      diagnostic-only: what fraction of a session's committed
+                      lines still survive in HEAD (a rework health signal —
+                      never a target, never compared across people)
 
 Distillation (agent-written session summaries — see README):
   setup-hooks         add a Claude Code Stop hook (agent-written session
@@ -638,6 +680,7 @@ const commands = {
   sync: cmdSync,
   scan: cmdScan,
   why: cmdWhy,
+  churn: cmdChurn,
   daemon: cmdDaemon,
   start: cmdStart,
   stop: cmdStop,
