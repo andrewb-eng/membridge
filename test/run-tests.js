@@ -5537,6 +5537,89 @@ async function main() {
     });
   }
 
+  // --- Phase 3 Task 4: spine hardening -------------------------------------
+  // (a) honor core.hooksPath; (b) atomic O_APPEND on commits.jsonl; (c) skip a
+  // repo whose HEAD is unchanged since the cursor last caught up.
+  {
+    // (a) A repo with a custom core.hooksPath must get its post-commit hook in
+    // THAT directory (else those users get no capture), and lose it on removal.
+    const projHP = path.join(ROOT, 'projects', 'hookspath-app');
+    fs.mkdirSync(projHP, { recursive: true });
+    const ghp = args => spawnSync('git', ['-C', projHP, ...args], { encoding: 'utf8' });
+    ghp(['init', '-q']);
+    ghp(['config', 'core.hooksPath', '.myhooks']);
+    { const st = util.loadState(); st.projects[projHP] = { events: [] }; util.saveState(st); }
+    const hpSettings = path.join(ROOT, 'claude-settings-hp.json');
+    const hpEnv = { ...process.env, MEMBRIDGE_CLAUDE_SETTINGS: hpSettings };
+    const hpSetup = spawnSync(process.execPath, [BIN, 'setup-hooks'], { env: hpEnv, encoding: 'utf8' });
+    check('spine: setup-hooks honors core.hooksPath (writes into the configured hooks dir)', () => {
+      assert.strictEqual(hpSetup.status, 0, hpSetup.stderr);
+      const custom = path.join(projHP, '.myhooks', 'post-commit');
+      assert.ok(fs.existsSync(custom), `hook not written to core.hooksPath dir; expected ${custom}`);
+      assert.ok(read(custom).includes('membridge-hook.js'), 'membridge line missing from the custom hooks dir');
+      assert.ok(!fs.existsSync(path.join(projHP, '.git', 'hooks', 'post-commit')),
+        'must NOT fall back to .git/hooks when core.hooksPath is set');
+    });
+    const hpRemove = spawnSync(process.execPath, [BIN, 'remove-hooks'], { env: hpEnv, encoding: 'utf8' });
+    check('spine: remove-hooks honors core.hooksPath (strips from the configured hooks dir)', () => {
+      assert.strictEqual(hpRemove.status, 0, hpRemove.stderr);
+      assert.ok(!fs.existsSync(path.join(projHP, '.myhooks', 'post-commit')),
+        'a membridge-only hook in the custom dir must be removed');
+    });
+
+    // (b) Two processes appending concurrently to commits.jsonl must not
+    // interleave or tear a line — a single atomic O_APPEND write per record.
+    const projAppend = path.join(ROOT, 'projects', 'concurrent-append-app');
+    fs.mkdirSync(path.join(projAppend, '.membridge'), { recursive: true });
+    const commitsPath = path.join(__dirname, '..', 'lib', 'commits.js');
+    const childSrc = tag => `const c=require(${JSON.stringify(commitsPath)});` +
+      `for(let i=0;i<200;i++){c.recordCommit(${JSON.stringify(projAppend)},{sha:'${tag}'+i,ts:'t',project:'p',sessions:[],unattributed:[]});}`;
+    const p1 = spawn(process.execPath, ['-e', childSrc('A')], { encoding: 'utf8' });
+    const p2 = spawn(process.execPath, ['-e', childSrc('B')], { encoding: 'utf8' });
+    await Promise.all([p1, p2].map(p => new Promise(res => p.on('close', res))));
+    check('spine: concurrent appends to commits.jsonl never interleave or tear a line', () => {
+      const raw = read(path.join(projAppend, '.membridge', 'commits.jsonl'));
+      const lines = raw.split('\n').filter(l => l.trim());
+      assert.strictEqual(lines.length, 400, `expected 400 intact lines, got ${lines.length}`);
+      let bad = 0;
+      for (const l of lines) { try { JSON.parse(l); } catch { bad++; } }
+      assert.strictEqual(bad, 0, `${bad} torn/interleaved line(s) — appends were not atomic`);
+      assert.strictEqual(require('../lib/commits').loadCommitMap(projAppend).length, 400);
+    });
+
+    // (c) An unchanged HEAD (cursor already at HEAD) must skip the git-log
+    // backfill entirely — proven by spying on newCommitsSince.
+    const projTick = path.join(ROOT, 'projects', 'tick-skip-app');
+    fs.mkdirSync(path.join(projTick, 'src'), { recursive: true });
+    const gt = args => spawnSync('git', ['-C', projTick, ...args], { encoding: 'utf8' });
+    gt(['init', '-q']); gt(['config', 'user.email', 'me@local.dev']); gt(['config', 'user.name', 'Me']);
+    { const st = util.loadState(); st.projects[projTick] = { events: [] }; util.saveState(st); }
+    fs.writeFileSync(path.join(projTick, 'src', 't.js'), 't\n');
+    gt(['add', '-A']); gt(['commit', '-q', '-m', 'c1']);
+    syncOnce({ project: projTick }); // cursor now caught up to HEAD
+    const cm = require('../lib/commits');
+    const origNCS = cm.newCommitsSince;
+    let ncsCalls = 0;
+    cm.newCommitsSince = (...a) => { ncsCalls++; return origNCS(...a); };
+    try {
+      syncOnce({ project: projTick }); // HEAD unchanged since cursor caught up
+      check('spine: an unchanged HEAD skips the git-log backfill (cheap rev-parse compare)', () => {
+        assert.strictEqual(ncsCalls, 0, 'newCommitsSince must NOT run when HEAD is unchanged and the cursor is at HEAD');
+      });
+      fs.writeFileSync(path.join(projTick, 'src', 't2.js'), 't2\n');
+      gt(['add', '-A']); gt(['commit', '-q', '-m', 'c2']);
+      const sha2 = gt(['rev-parse', 'HEAD']).stdout.trim();
+      ncsCalls = 0;
+      syncOnce({ project: projTick }); // HEAD moved: backfill must run again
+      check('spine: a moved HEAD resumes the backfill and records the new commit', () => {
+        assert.ok(ncsCalls > 0, 'newCommitsSince must run once HEAD moves');
+        assert.ok(cm.loadCommitMap(projTick).some(r => r.sha === sha2), 'the new commit must be recorded');
+      });
+    } finally {
+      cm.newCommitsSince = origNCS;
+    }
+  }
+
   check('project-resolve: resolveRoot returns nearest tracked ancestor, else null', () => {
     const base = fs.mkdtempSync(path.join(os.tmpdir(), 'mb-resolve-'));
     const repo = path.join(base, 'repo');
