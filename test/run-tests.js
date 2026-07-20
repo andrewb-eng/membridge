@@ -793,6 +793,34 @@ async function main() {
         assert.ok(/clearSpinner\(/.test(src), `${name} does not clear the spinner`);
       });
     });
+    // Fix round: the spinner's 3s paint replaces host content, which the
+    // fp-dedup guards (fp === feedFp/pxFp && host.firstChild → skip render)
+    // cannot see — a slow-but-unchanged poll tick stranded the spinner, and
+    // the paint could wipe an open ⋯ menu the dedup branch protects.
+    check('spinner paint is observable: fp-dedup skips must re-render a painted-over host, and an open ⋯ menu blocks the paint', () => {
+      assert.ok(/function clearSpinner\(viewKey, token\)[\s\S]{0,400}return !!spinnerPainted\[viewKey\]/.test(embeddedScript),
+        'clearSpinner does not report whether the timer already painted');
+      assert.ok(embeddedScript.includes('function spinnerRendered('),
+        'spinnerRendered reset helper missing (painted debt must clear only on a real render)');
+      const feedSrc = extractFn(embeddedScript, 'loadFeed');
+      assert.ok(/fp === feedFp && host\.firstChild && !spinnerPaintedOver/.test(feedSrc),
+        "loadFeed's fp-dedup skip does not consult the painted flag");
+      const pxSrc = extractFn(embeddedScript, 'loadProjectsIndex');
+      const pxGuards = pxSrc.match(/fp === pxFp && host\.firstChild && !spinnerPaintedOver/g) || [];
+      assert.ok(pxGuards.length >= 2,
+        `loadProjectsIndex's fp-dedup skips must both consult the painted flag (found ${pxGuards.length})`);
+      // menu guard: the paint path must skip when the projects ⋯ menu/confirm is open
+      assert.ok(/skipPaint && skipPaint\(\)/.test(embeddedScript), 'paint path has no skip-paint guard');
+      assert.ok(/armSpinner\('projects'[\s\S]{0,140}pxMenuId \|\| pxConfirmId/.test(pxSrc),
+        'projects loader does not pass the open-menu guard to armSpinner');
+    });
+    check('switching/joining/creating/leaving a team resets the feed filter unions (stale old-team options cannot persist)', () => {
+      assert.ok(embeddedScript.includes('function resetFeedFilterUnions('), 'union reset helper missing');
+      assert.ok(/data-ts-switchto[\s\S]{0,220}resetFeedFilterUnions\(\)/.test(embeddedScript),
+        'switch-to branch does not reset the unions');
+      assert.ok(/\/api\/team\/join'[\s\S]{0,260}resetFeedFilterUnions\(\)/.test(embeddedScript),
+        'join flow does not reset the unions');
+    });
     const bulkFnSrc = extractFn(embeddedScript, 'deleteProjectsBulk');
     check('deleteProjectsBulk helper exists standalone in the embedded script', () => {
       assert.ok(bulkFnSrc, 'deleteProjectsBulk function not found');
