@@ -735,6 +735,64 @@ async function main() {
       }
       return src.slice(startIdx, end);
     }
+    // ---- Five Electron-runtime UI bug fixes. No DOM runtime in this suite,
+    // so these are source-level presence/shape assertions against the served
+    // pageHtml/embeddedScript (both already fully rendered by dashboardPage()). ----
+    check('dashboard embedded script never calls window.prompt/confirm/alert (Electron has no window.prompt — it silently no-ops)', () => {
+      assert.ok(!embeddedScript.includes('window.prompt('), 'window.prompt( still present');
+      assert.ok(!embeddedScript.includes('window.confirm('), 'window.confirm( still present');
+      assert.ok(!embeddedScript.includes('window.alert('), 'window.alert( still present');
+      assert.ok(!/(^|[^.\w])prompt\(/.test(embeddedScript), 'a bare prompt( call is still present');
+      assert.ok(!/(^|[^.\w])confirm\(/.test(embeddedScript), 'a bare confirm( call is still present');
+      assert.ok(!/(^|[^.\w])alert\(/.test(embeddedScript), 'a bare alert( call is still present');
+    });
+    check('dashboard has a reusable in-app prompt modal joined to the overlay + Escape idiom', () => {
+      assert.ok(pageHtml.includes('id="promptOverlay"'), 'prompt overlay markup missing');
+      assert.ok(pageHtml.includes('id="promptInput"'), 'prompt input missing');
+      assert.ok(pageHtml.includes('id="promptConfirm"'), 'prompt confirm button missing');
+      assert.ok(embeddedScript.includes('function openPrompt('), 'openPrompt helper missing');
+      assert.ok(/promptInput[\s\S]{0,400}key === 'Enter'/.test(embeddedScript), 'Enter-confirms wiring missing');
+      assert.ok(/hadModal[\s\S]{0,400}promptOverlay/.test(embeddedScript), 'prompt overlay not joined to the Escape hadModal chain');
+      assert.ok(/window\.addEventListener\('keydown'[\s\S]{0,900}closePrompt\(\)/.test(embeddedScript), 'Escape does not close the prompt overlay');
+      assert.ok(embeddedScript.includes("teamRequest('/api/team/create'"), 'create still runs the same teamRequest flow');
+      assert.ok(embeddedScript.includes("teamRequest('/api/team/join'"), 'join still runs the same teamRequest flow');
+      assert.ok(embeddedScript.includes("teamRequest('/api/team/rename'"), 'rename still runs the same teamRequest flow');
+    });
+    check('feedFilterBarHtml renders a stable, never-shrinking union of tools/projects instead of deriving from filtered entries', () => {
+      const barFnSrc = extractFn(embeddedScript, 'feedFilterBarHtml');
+      assert.ok(barFnSrc, 'feedFilterBarHtml not found');
+      assert.ok(embeddedScript.includes('feedToolsSeen') && embeddedScript.includes('feedProjectsSeen'),
+        'stable-superset accumulator vars missing');
+      assert.ok(barFnSrc.includes('feedToolsSeen') && barFnSrc.includes('feedProjectsSeen'),
+        'feedFilterBarHtml does not read from the stable-superset accumulators');
+      // the old collapsing shape built a fresh tools/projects map off entries.forEach every render
+      assert.ok(!/entries\.forEach[\s\S]{0,200}tools\[e\.source\]/.test(barFnSrc),
+        'feedFilterBarHtml still derives tool options from its entries argument the old collapsing way');
+    });
+    check('Activity back control clears filters and re-renders Activity in place (no longer exits to the Projects index)', () => {
+      assert.ok(!embeddedScript.includes('← Catch-Up'), 'old "← Catch-Up" label still present');
+      assert.ok(embeddedScript.includes('← All activity'), 'new honest back-link label missing');
+      assert.ok(/data-feed="back"[\s\S]{0,600}feedFilters\s*=\s*\{\s*author:\s*null,\s*project:\s*null,\s*source:\s*null\s*\}/.test(embeddedScript),
+        'back handler does not clear feedFilters to {author:null,project:null,source:null}');
+    });
+    check('Team empty-state card reuses the header brand mark above "No team yet"', () => {
+      const noneFnSrc = extractFn(embeddedScript, 'teamScreenNone');
+      assert.ok(noneFnSrc, 'teamScreenNone not found');
+      assert.ok(noneFnSrc.includes('brand-mark'), 'brand-mark asset missing from the team empty state');
+      assert.ok(noneFnSrc.includes('No team yet'), 'heading missing');
+      assert.ok(noneFnSrc.indexOf('brand-mark') < noneFnSrc.indexOf('No team yet'), 'brand mark is not positioned above the heading');
+    });
+    check('a reusable slow-load spinner arms at 3s and is wired into the three view loaders', () => {
+      assert.ok(/SPINNER_DELAY_MS\s*=\s*3000/.test(embeddedScript), '3s spinner delay constant missing');
+      assert.ok(embeddedScript.includes('function armSpinner('), 'armSpinner helper missing');
+      assert.ok(embeddedScript.includes('function clearSpinner('), 'clearSpinner helper missing');
+      ['loadProjectsIndex', 'loadFeed', 'renderTeamScreen'].forEach((name) => {
+        const src = extractFn(embeddedScript, name);
+        assert.ok(src, `${name} not found`);
+        assert.ok(/armSpinner\(/.test(src), `${name} does not arm the spinner`);
+        assert.ok(/clearSpinner\(/.test(src), `${name} does not clear the spinner`);
+      });
+    });
     const bulkFnSrc = extractFn(embeddedScript, 'deleteProjectsBulk');
     check('deleteProjectsBulk helper exists standalone in the embedded script', () => {
       assert.ok(bulkFnSrc, 'deleteProjectsBulk function not found');
