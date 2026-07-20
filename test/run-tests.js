@@ -923,6 +923,64 @@ async function main() {
       }
       return src.slice(startIdx, end);
     }
+    // esc is declared as `var esc = function (s) { ... };`, not a `function
+    // esc(` declaration, so extractFn's pattern can't find it. Card-headline
+    // sandbox tests below need esc's real source (runHeadline calls it), so
+    // brace-match the var-assignment form separately.
+    function extractVarFn(src, name) {
+      const startIdx = src.indexOf('var ' + name + ' = function');
+      if (startIdx === -1) return null;
+      let i = src.indexOf('{', startIdx);
+      let depth = 0, end = i;
+      for (; end < src.length; end++) {
+        if (src[end] === '{') depth++;
+        else if (src[end] === '}') { depth--; if (depth === 0) { end++; break; } }
+      }
+      return src.slice(startIdx, end) + ';';
+    }
+    // Card-headline helpers (firstSentence / askHeadline / runHeadline) are pure
+    // client functions with no DOM dependency — extract their source from the
+    // embedded script and evaluate them in a sandbox, same technique as
+    // deleteProjectsBulk above. See specs/2026-07-20-activity-display-headline.
+    check('headline helpers: firstSentence / askHeadline behavior', () => {
+      const src = ['esc', 'firstSentence', 'askHeadline'].map(n => extractFn(embeddedScript, n)).join('\n');
+      const sandbox = new Function(src + '\nreturn { firstSentence: firstSentence, askHeadline: askHeadline };')();
+      assert.strictEqual(sandbox.firstSentence('One thing. Two thing.'), 'One thing.');
+      assert.strictEqual(sandbox.firstSentence(''), '');
+      assert.ok(sandbox.firstSentence('x'.repeat(200)).length <= 92, 'not capped');
+      assert.strictEqual(sandbox.askHeadline(''), null);
+      assert.strictEqual(sandbox.askHeadline('Add a logout button'), 'Add a logout button');
+      assert.strictEqual(sandbox.askHeadline('Install failed: Error at /x lockdownd\n\n\nstack'), null, 'noisy ask not degraded');
+    });
+    check('headline helpers: runHeadline behavior', () => {
+      const escSrc = extractVarFn(embeddedScript, 'esc') || '';
+      const fnSrc = ['firstSentence', 'askHeadline', 'runHeadline'].map(n => extractFn(embeddedScript, n)).join('\n');
+      const sandbox = new Function(escSrc + '\n' + fnSrc + '\nreturn { runHeadline: runHeadline };')();
+      // Distilled rep WITH a headline wins outright, and is escaped.
+      assert.strictEqual(
+        sandbox.runHeadline({ headline: 'Fixed the <bug>', summary: 'Long summary text. More.' }, null, false),
+        'Fixed the &lt;bug&gt;'
+      );
+      // Distilled rep with NO headline falls back to the first sentence of the summary.
+      assert.strictEqual(
+        sandbox.runHeadline({ summary: 'Did the thing. And then some more.' }, null, false),
+        'Did the thing.'
+      );
+      // No rep + live + clean ask -> guarded "Working on: <ask>".
+      const liveClean = sandbox.runHeadline(null, { ask: 'Add a logout button' }, true);
+      assert.ok(liveClean.includes('Working on:') && liveClean.includes('Add a logout button'), 'clean live ask not shown');
+      // No rep + live + noisy ask -> "Working…", never the raw noisy ask.
+      const liveNoisy = sandbox.runHeadline(null, { ask: 'Install failed: Error at /x lockdownd\n\n\nstack' }, true);
+      assert.ok(liveNoisy.includes('Working…'), 'noisy live ask not guarded to Working…');
+      assert.ok(!liveNoisy.includes('lockdownd'), 'noisy live ask text leaked through');
+      // No rep + finished + no ask -> plain placeholder, never harvested prose.
+      // runHeadline's signature is (rep, newest, live) — it has no repHarvested
+      // parameter at all, so any harvested-looking data hanging off `newest`
+      // cannot reach the headline; this proves the finished branch ignores it.
+      const finished = sandbox.runHeadline(null, { ask: '', repHarvested: { summary: 'HARVESTED PROSE' } }, false);
+      assert.ok(finished.includes('session ended') && finished.includes('no summary shared'), 'finished no-ask placeholder missing');
+      assert.ok(!finished.includes('HARVESTED PROSE'), 'harvested text leaked into the headline');
+    });
     // ---- Five Electron-runtime UI bug fixes. No DOM runtime in this suite,
     // so these are source-level presence/shape assertions against the served
     // pageHtml/embeddedScript (both already fully rendered by dashboardPage()). ----
