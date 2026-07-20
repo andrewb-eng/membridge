@@ -201,6 +201,194 @@ async function main() {
     const banned = db.entries.find(e => e.ask.includes('sk-test1234567890abcdef'));
     assert.ok(!banned, 'secret leaked into memory DB');
   });
+  // --- 1b. capture provenance: the codex adapter must never mislabel foreign
+  // files. Codex Desktop's history importer writes rollout-SHAPED files for
+  // OTHER tools' sessions (history_mode "legacy", sometimes originator
+  // "Claude Cowork") under ~/.codex/sessions — those and any Claude-Code-shaped
+  // JSONL in the codex root must be skipped, not stamped 'Codex'. ---
+  check('codex: an imported legacy rollout (history_mode "legacy" / Cowork originator) is skipped, never stamped Codex', () => {
+    const fsA = {};
+    const evsA = codexAdapter.extractEvents([
+      { timestamp: '2026-07-18T23:08:43.825Z', type: 'session_meta', payload: { id: 'imp-1', cwd: proj1, originator: 'Codex Desktop', history_mode: 'legacy' } },
+      { timestamp: '2026-07-18T23:08:43.831Z', type: 'event_msg', payload: { type: 'user_message', message: 'how do i get to it fast' } },
+    ], fsA);
+    assert.deepStrictEqual(evsA, [], 'imported legacy rollout produced Codex events');
+    assert.ok(fsA.foreign, 'imported file not marked foreign');
+    const fsB = {};
+    const evsB = codexAdapter.extractEvents([
+      { timestamp: '2026-07-18T23:08:47.000Z', type: 'session_meta', payload: { id: 'imp-2', cwd: proj1, originator: 'Claude Cowork' } },
+      { timestamp: '2026-07-18T23:08:47.100Z', type: 'event_msg', payload: { type: 'user_message', message: 'morning email summary please' } },
+    ], fsB);
+    assert.deepStrictEqual(evsB, [], 'Cowork-originated rollout produced Codex events');
+    assert.ok(fsB.foreign, 'Cowork file not marked foreign');
+    // once foreign, later incremental batches stay skipped even with codex-ish lines
+    const evsA2 = codexAdapter.extractEvents([
+      { timestamp: '2026-07-18T23:09:00.000Z', type: 'event_msg', payload: { type: 'user_message', message: 'try again', cwd: proj1 } },
+    ], fsA);
+    assert.deepStrictEqual(evsA2, [], 'foreign file resumed emitting on a later batch');
+  });
+  check('codex: a Claude-Code-shaped transcript in the codex root is skipped (no session_meta opener)', () => {
+    const fsC = {};
+    const evsC = codexAdapter.extractEvents([
+      { type: 'user', message: { role: 'user', content: 'Build the login page with OAuth' }, cwd: proj1, timestamp: '2026-07-10T10:00:00.000Z' },
+      { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'x'.repeat(120) }] }, cwd: proj1, timestamp: '2026-07-10T10:01:00.000Z' },
+    ], fsC);
+    assert.deepStrictEqual(evsC, [], 'Claude-shaped transcript produced Codex events');
+    assert.ok(fsC.foreign, 'Claude-shaped file not marked foreign');
+  });
+  check('codex: a genuine rollout still ingests as Codex (no regression), and the verdict persists in fileState', () => {
+    const fsD = {};
+    const evsD = codexAdapter.extractEvents([
+      { timestamp: '2026-07-09T10:05:00.000Z', type: 'session_meta', payload: { id: 'gen-1', cwd: proj1, originator: 'codex_cli_rs' } },
+      { timestamp: '2026-07-09T10:06:00.000Z', type: 'event_msg', payload: { type: 'user_message', message: 'Add unit tests for the login form' } },
+    ], fsD);
+    assert.strictEqual(evsD.length, 1, `expected 1 event, got ${evsD.length}`);
+    assert.strictEqual(evsD[0].source, 'Codex');
+    assert.strictEqual(evsD[0].project, proj1);
+    assert.ok(fsD.validated, 'genuine file not stamped validated');
+    // incremental follow-up batch (no session_meta) keeps working off the verdict
+    const evsD2 = codexAdapter.extractEvents([
+      { timestamp: '2026-07-09T10:07:00.000Z', type: 'event_msg', payload: { type: 'user_message', message: 'Now wire the submit button' } },
+    ], fsD);
+    assert.strictEqual(evsD2.length, 1, 'validated file stopped ingesting on incremental read');
+  });
+  check('codex cleanup: purges mislabeled sessions + resets offsets, leaves genuine and undecidable files alone', () => {
+    const scanMod = require('../lib/scan');
+    const foreignFile = '/fake/.codex/sessions/2026/07/18/rollout-fake-import.jsonl';
+    const genuineFile = '/fake/.codex/sessions/2026/06/01/rollout-real.jsonl';
+    const missingFile = '/fake/.codex/sessions/2026/05/01/rollout-gone.jsonl';
+    const st = {
+      files: {
+        [foreignFile]: { offset: 999, adapter: 'codex', data: { cwd: proj1 } },
+        [genuineFile]: { offset: 500, adapter: 'codex', data: { cwd: '/other/proj' } },
+        [missingFile]: { offset: 42, adapter: 'codex', data: {} },
+        '/fake/claude/x.jsonl': { offset: 5, adapter: 'claude-code', data: {} },
+      },
+      projects: {
+        [proj1]: { events: [
+          { ts: '2026-07-18T23:08:43.831Z', project: proj1, source: 'Codex', kind: 'prompt', text: 'mislabeled', session: 'rollout-fake-import' },
+          { ts: '2026-07-18T23:08:43.900Z', project: proj1, source: 'Codex', kind: 'prompt', text: 'unjudgeable', session: 'rollout-gone' },
+          { ts: '2026-07-09T10:00:00.000Z', project: proj1, source: 'Claude Code', kind: 'prompt', text: 'real claude', session: 'sess-c' },
+        ] },
+        '/other/proj': { events: [
+          { ts: '2026-06-01T09:00:00.000Z', project: '/other/proj', source: 'Codex', kind: 'prompt', text: 'genuine codex', session: 'rollout-real' },
+        ] },
+      },
+    };
+    const purged = scanMod.cleanupCodexMislabels(st, { readFirstEntry: f =>
+      f === foreignFile ? { type: 'session_meta', payload: { id: 'i', cwd: proj1, history_mode: 'legacy' } }
+      : f === genuineFile ? { type: 'session_meta', payload: { id: 'g', cwd: '/other/proj' } }
+      : null });
+    assert.deepStrictEqual(purged, ['rollout-fake-import'], 'purge set is not exactly the foreign file');
+    assert.ok(!st.files[foreignFile], 'foreign file offsets not reset');
+    assert.ok(st.files[genuineFile] && st.files[genuineFile].data.validated, 'genuine file not stamped validated');
+    assert.strictEqual(st.files[genuineFile].offset, 500, 'genuine file offset must not reset');
+    assert.ok(st.files[missingFile], 'undecidable (missing) file must be left alone');
+    assert.deepStrictEqual(st.projects[proj1].events.map(e => e.session), ['rollout-gone', 'sess-c'],
+      'purge must remove exactly the foreign-file Codex events');
+    assert.strictEqual(st.projects['/other/proj'].events.length, 1, 'genuine Codex session on another project was deleted');
+    assert.ok(st.projects[proj1].dirty, 'purged project not marked dirty for re-render');
+    assert.ok(!st.projects['/other/proj'].dirty, 'untouched project must not be dirtied');
+    // second pass is a no-op for decided recs: even a reader that now calls
+    // everything legacy must not re-judge the validated genuine file. The
+    // still-missing file stays undecided (it would be judged if it appeared —
+    // deliberate self-healing).
+    const purged2 = scanMod.cleanupCodexMislabels(st, { readFirstEntry: f =>
+      f === missingFile ? null : { type: 'session_meta', payload: { id: 'z', history_mode: 'legacy' } } });
+    assert.deepStrictEqual(purged2, [], 'cleanup re-judged already-decided files');
+  });
+  // ACCEPTANCE e2e: replicate the real damage (imported rollout on disk, its
+  // events already in state as 'Codex') — after a sync, the project has ZERO
+  // Codex sessions from imported files, genuine Codex events survive, and a
+  // re-scan does not re-introduce the mislabels.
+  {
+    const impDir = path.join(process.env.MEMBRIDGE_CODEX_DIR, '2026', '07', '18');
+    fs.mkdirSync(impDir, { recursive: true });
+    const impFile = path.join(impDir, 'rollout-import-e2e.jsonl');
+    fs.writeFileSync(impFile, jsonl([
+      { timestamp: '2026-07-18T23:08:43.825Z', type: 'session_meta', payload: { id: 'imp-e2e', cwd: proj1, originator: 'Codex Desktop', history_mode: 'legacy' } },
+      { timestamp: '2026-07-18T23:08:43.831Z', type: 'event_msg', payload: { type: 'user_message', message: 'i had an idea as another feature for membridge' } },
+    ]));
+    const stSeed = util.loadState();
+    const p1key = Object.keys(stSeed.projects || {}).find(k => util.normPath(k) === util.normPath(proj1));
+    assert.ok(p1key, 'proj1 missing from state before acceptance seed');
+    // pre-fix damage: file fully consumed by the old adapter, events stamped Codex
+    stSeed.files[impFile] = { offset: fs.statSync(impFile).size, adapter: 'codex', data: { cwd: proj1 } };
+    stSeed.projects[p1key].events.push(
+      { ts: '2026-07-18T23:08:43.831Z', project: p1key, source: 'Codex', kind: 'prompt', text: 'i had an idea as another feature for membridge', session: 'rollout-import-e2e' });
+    util.saveState(stSeed);
+    syncOnce();
+    check('ACCEPTANCE: after fix + cleanup + re-scan the project has zero imported-Codex sessions, genuine Codex intact', () => {
+      const st = util.loadState();
+      const evs = st.projects[p1key].events || [];
+      assert.ok(!evs.some(e => e.source === 'Codex' && e.session === 'rollout-import-e2e'),
+        'mislabeled imported session still present after cleanup');
+      assert.ok(evs.some(e => e.source === 'Codex' && e.session === 'rollout-1'),
+        'genuine Codex session was wrongly purged');
+      assert.ok(!st.files[impFile] || (st.files[impFile].data || {}).foreign,
+        'imported file is neither reset nor marked foreign');
+    });
+    syncOnce(); // re-scan: the reset offsets re-read the import file from 0
+    check('ACCEPTANCE: a re-scan does not re-introduce the mislabeled sessions as Codex', () => {
+      const st = util.loadState();
+      const evs = st.projects[p1key].events || [];
+      assert.ok(!evs.some(e => e.source === 'Codex' && e.session === 'rollout-import-e2e'),
+        're-scan re-ingested the imported file as Codex');
+      assert.ok((st.files[impFile] && st.files[impFile].data || {}).foreign,
+        'rescanned import file not marked foreign in fileState');
+    });
+  }
+  // A project whose ONLY events were mislabeled (the real outer-dir case) is
+  // purged to empty — its already-injected context block must still be
+  // REWRITTEN clean, not skipped by the events-empty render guard, and dirty
+  // must clear rather than leak true forever.
+  {
+    const projX = path.join(ROOT, 'projects', 'outer-shell');
+    fs.mkdirSync(path.join(projX, '.membridge'), { recursive: true });
+    fs.writeFileSync(path.join(projX, 'CLAUDE.md'),
+      '# Outer shell\n\n' + digest.BEGIN + '\n- 2026-07-18 23:08 · Codex: polluted mislabeled ask\n' + digest.END + '\n');
+    const impDir2 = path.join(process.env.MEMBRIDGE_CODEX_DIR, '2026', '07', '18');
+    const impFile2 = path.join(impDir2, 'rollout-import-outer.jsonl');
+    fs.writeFileSync(impFile2, jsonl([
+      { timestamp: '2026-07-18T23:08:44.000Z', type: 'session_meta', payload: { id: 'imp-outer', cwd: projX, originator: 'Codex Desktop', history_mode: 'legacy' } },
+      { timestamp: '2026-07-18T23:08:44.100Z', type: 'event_msg', payload: { type: 'user_message', message: 'polluted mislabeled ask' } },
+    ]));
+    const stSeed2 = util.loadState();
+    stSeed2.files[impFile2] = { offset: fs.statSync(impFile2).size, adapter: 'codex', data: { cwd: projX } };
+    stSeed2.projects[projX] = { events: [
+      { ts: '2026-07-18T23:08:44.100Z', project: projX, source: 'Codex', kind: 'prompt', text: 'polluted mislabeled ask', session: 'rollout-import-outer' },
+    ] };
+    util.saveState(stSeed2);
+    syncOnce();
+    check('cleanup: a project purged to EMPTY still gets its polluted context block rewritten clean, dirty cleared', () => {
+      const st = util.loadState();
+      const key = Object.keys(st.projects).find(k => util.normPath(k) === util.normPath(projX));
+      assert.ok(key, 'outer-shell project lost from state');
+      assert.strictEqual((st.projects[key].events || []).length, 0, 'mislabeled event not purged');
+      const md = read(path.join(projX, 'CLAUDE.md'));
+      assert.ok(md.includes('# Outer shell'), 'original content lost');
+      assert.ok(md.includes(digest.BEGIN), 'block markers lost');
+      assert.ok(!md.includes('polluted mislabeled ask'), 'purged Codex ask still injected in CLAUDE.md');
+      assert.ok(!st.projects[key].dirty, 'dirty flag leaked true on the purged-to-empty project');
+    });
+  }
+  check('cleanup default reader: a blank first line does not stall the verdict (file still judged from its first real line)', () => {
+    const scanMod = require('../lib/scan');
+    const blankDir = path.join(ROOT, 'codex-blankline');
+    fs.mkdirSync(blankDir, { recursive: true });
+    const blankFile = path.join(blankDir, 'rollout-blank-first.jsonl');
+    fs.writeFileSync(blankFile,
+      '\n' + JSON.stringify({ timestamp: '2026-07-18T23:08:45.000Z', type: 'session_meta', payload: { id: 'b1', cwd: proj1, history_mode: 'legacy' } }) + '\n');
+    const st = {
+      files: { [blankFile]: { offset: 10, adapter: 'codex', data: {} } },
+      projects: { [proj1]: { events: [
+        { ts: '2026-07-18T23:08:45.000Z', project: proj1, source: 'Codex', kind: 'prompt', text: 'x', session: 'rollout-blank-first' },
+      ] } },
+    };
+    const purged = scanMod.cleanupCodexMislabels(st); // default disk reader
+    assert.deepStrictEqual(purged, ['rollout-blank-first'], 'blank-first-line import file was not judged');
+    assert.strictEqual(st.projects[proj1].events.length, 0, 'its mislabeled event survived');
+  });
   check('projectStats: week-windowed sessions, distinct files, deduped open todos', () => {
     const now = Date.parse('2026-07-14T12:00:00.000Z');
     const iso = d => new Date(now - d * 86400000).toISOString();
