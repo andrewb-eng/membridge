@@ -821,6 +821,85 @@ async function main() {
       assert.ok(/\/api\/team\/join'[\s\S]{0,260}resetFeedFilterUnions\(\)/.test(embeddedScript),
         'join flow does not reset the unions');
     });
+    // ---- Round 3 Electron-runtime UI bugs: team create/join failing silently,
+    // the Activity project filter matching on display name, and the session
+    // page's old no-summary liveness rule. Same contract as the rounds above:
+    // browser behavior is pinned by source-shape assertions (no DOM runtime in
+    // this suite); the server half of each contract is exercised for real. ----
+    const noAuthCreate = await fetch(`${base}/api/team/create`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'ghost-team' }),
+    });
+    const noAuthCreateBody = await noAuthCreate.json().catch(() => ({}));
+    const noAuthJoin = await fetch(`${base}/api/team/join`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ inviteCode: 'no-such-code' }),
+    });
+    const noAuthJoinBody = await noAuthJoin.json().catch(() => ({}));
+    check('unauthenticated /api/team/create + /join answer a non-2xx with an error body the UI can surface', () => {
+      assert.ok(!noAuthCreate.ok, 'unauthenticated create must not be 2xx');
+      assert.ok(noAuthCreateBody.error, 'create error body is empty');
+      assert.ok(!noAuthJoin.ok, 'unauthenticated join must not be 2xx');
+      assert.ok(noAuthJoinBody.error, 'join error body is empty');
+    });
+    check('Team screen surfaces create/join failures — auth-aware notice + sign-in gate, never a silent no-op', () => {
+      assert.ok(embeddedScript.includes('function tsNoticeHtml('), 'Team screen notice helper missing');
+      const tsViewSrc = extractFn(embeddedScript, 'renderTeamScreenView');
+      assert.ok(tsViewSrc && tsViewSrc.includes('tsNoticeHtml()'), 'Team screen view does not render the notice');
+      // Rejections must reach the notice — the old handlers swallowed them with
+      // an argument-less .catch(function () { setPill(false); }).
+      assert.ok(/\/api\/team\/create'[\s\S]{0,600}\.catch\(function \(err\)/.test(embeddedScript),
+        'create rejection is still swallowed (argument-less catch)');
+      assert.ok(/\/api\/team\/join'[\s\S]{0,600}\.catch\(function \(err\)/.test(embeddedScript),
+        'join rejection is still swallowed (argument-less catch)');
+      // A resolved-but-error body must surface too, not just rejections.
+      assert.ok(/r && r\.error/.test(embeddedScript), 'resolved r.error responses are not surfaced');
+      // Auth failures get actionable copy; other failures show the server error.
+      assert.ok(embeddedScript.includes('Sign in to create a team'), 'auth-failure copy missing (create)');
+      assert.ok(embeddedScript.includes('Sign in to join a team'), 'auth-failure copy missing (join)');
+      // Signed-out empty state gates behind sign-in instead of two dead buttons.
+      const noneSrc = extractFn(embeddedScript, 'teamScreenNone');
+      assert.ok(noneSrc && noneSrc.includes('authenticated'), 'team empty state ignores auth state');
+      assert.ok(noneSrc.includes('data-ts-signin'), 'signed-out empty state has no sign-in CTA');
+      // Happy path intact: a returned team_id is remembered and the screen re-renders.
+      assert.ok(/r\.team_id\) \{ rememberTeam\(r\.team_id\); resetFeedFilterUnions\(\); \}/.test(embeddedScript),
+        'create/join happy path no longer remembers the new team');
+      // The notice clears only on a REAL /api/team payload: renderTeamScreen's
+      // fetch coerces a failure to null and flows through the success handler,
+      // which must not wipe a just-painted failure banner.
+      const tsLoadSrc = extractFn(embeddedScript, 'renderTeamScreen');
+      assert.ok(tsLoadSrc && /if \(tsTeamState\) \{ tsNotice = ''; tsNoticeAuth = false; \}/.test(tsLoadSrc),
+        'notice clear is not gated on a real /api/team payload — a failed reload wipes the banner');
+    });
+    const feedByPath = await (await fetch(`${base}/api/feed?project=${encodeURIComponent(proj1)}&limit=50`)).json();
+    check('Activity project filter: a tracked project path returns that project\'s local entries', () => {
+      const locals = (feedByPath.entries || []).filter(e => e.origin === 'local');
+      assert.ok(locals.length > 0, 'path filter returned no local entries for a project with activity');
+      assert.ok(locals.every(e => e.projectPath === proj1), 'foreign entries leaked through the project filter');
+    });
+    check('Activity project dropdown sends the value the feed filters on (projectId/projectPath) — display name is label only', () => {
+      const barFnSrc = extractFn(embeddedScript, 'feedFilterBarHtml');
+      assert.ok(barFnSrc, 'feedFilterBarHtml not found');
+      assert.ok(!/feedProjectsSeen\[e\.project\]/.test(barFnSrc),
+        'dropdown still keys project options by display name — /api/feed matches projectPath/projectId, so a name value returns "Nothing to show"');
+      assert.ok(/e\.projectId \|\| e\.projectPath/.test(barFnSrc),
+        'dropdown option value is not the id-preferred precedence the .fproj pill and /api/feed use');
+    });
+    check("session page liveness = the feed's STALE_GAP wall-clock rule (an old session renders finished, never 'working now')", () => {
+      const sessSrc = extractFn(embeddedScript, 'sessionPageHtml');
+      assert.ok(sessSrc, 'sessionPageHtml not found');
+      assert.ok(/\(Date\.now\(\) - \(Date\.parse\(t\.ts\) \|\| 0\)\) < STALE_GAP/.test(sessSrc),
+        'session page does not compute live from STALE_GAP');
+      assert.ok(!/wip = !t\.rep/.test(sessSrc), 'old summary-claim liveness (wip = !t.rep) still drives the page');
+      assert.ok(/live\s*\n?\s*\?[\s\S]{0,420}working now/.test(sessSrc), '"working now" badge is not gated on live');
+      assert.ok(/tail = live/.test(sessSrc), "timeline 'working…' tail is not gated on live");
+      assert.ok(sessSrc.includes('session ended'), 'stale-session finished fallback missing');
+      assert.ok(sessSrc.includes('repHarvested'), 'harvested-summary fallback missing for stale sessions');
+      // The 5s poll dedups on a serialized fingerprint; unless liveness is IN
+      // that fingerprint, a page opened while live keeps its "working now"
+      // badge forever once the session crosses STALE_GAP with no new entries.
+      const loadSessSrc = extractFn(embeddedScript, 'loadSession');
+      assert.ok(loadSessSrc && /STALE_GAP[\s\S]{0,200}sessFp|live[\s\S]{0,600}sessFp = fp/.test(loadSessSrc) && /live/.test(loadSessSrc),
+        "loadSession's dedup fingerprint ignores liveness — a stale session never repaints to finished");
+    });
     const bulkFnSrc = extractFn(embeddedScript, 'deleteProjectsBulk');
     check('deleteProjectsBulk helper exists standalone in the embedded script', () => {
       assert.ok(bulkFnSrc, 'deleteProjectsBulk function not found');
