@@ -951,13 +951,17 @@ async function main() {
       assert.ok(embeddedScript.includes("closest('[data-px-menu-pop]')"), 'outside-click dismiss check missing');
       assert.ok(/Escape[\s\S]{0,600}pxMenuId = null/.test(embeddedScript), 'Escape-key menu dismiss missing');
     });
-    check('dashboard page has the Settings screen with BYOK', () => {
+    check('dashboard Settings screen renders without the BYOK/advisor-key UI', () => {
       assert.ok(pageHtml.includes('view-settings'), 'settings view missing');
       assert.ok(pageHtml.includes('id="settingsRoot"'), 'settings host missing');
       assert.ok(pageHtml.includes('Watched projects'), 'watched projects section missing');
-      assert.ok(pageHtml.includes('AI briefings &amp; roadmaps'), 'BYOK section missing');
-      assert.ok(pageHtml.includes('Bring your own key'), 'BYOK copy missing');
       assert.ok(pageHtml.includes('Tools detected: '), 'tools-detected line missing');
+      // The BYOK advisor-key UI was removed from the dashboard Settings screen
+      // (the /api/advisor backend is retained and covered separately). The
+      // Settings screen must no longer surface any key-entry affordance.
+      assert.ok(!pageHtml.includes('AI briefings &amp; roadmaps'), 'BYOK section should be gone');
+      assert.ok(!pageHtml.includes('Bring your own key'), 'BYOK copy should be gone');
+      assert.ok(!pageHtml.includes('data-adv-key'), 'advisor key input should be gone');
     });
     check('dashboard page has multi-select + bulk delete for local watched projects', () => {
       assert.ok(embeddedScript.includes('data-bulk-check='), 'per-row bulk checkbox missing');
