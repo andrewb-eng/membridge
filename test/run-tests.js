@@ -1071,6 +1071,107 @@ async function main() {
       assert.ok(/runHeadline\(/.test(sub), 'subagentLine does not call runHeadline');
       assert.ok(!/repHarvested/.test(sub), 'subagentLine still references repHarvested');
     });
+    // buildDayCards (docs/superpowers/specs/2026-07-21-activity-day-drilldown-design.md, Task 1): groups
+    // buildUnits' output into one card per (author, project, local day). Pure
+    // client function, same extractFn+sandbox technique as the runHeadline
+    // checks above. unitWith builds a fixture shaped like a real buildUnits/
+    // finalizeUnit output (key, ts, author(Id), project(Id/Path), self, source,
+    // agentCount, promptCount, rep [a run with its own .rep distilled entry, or
+    // null], live, runs) so evalDayCards exercises the real grouping/rollup
+    // logic, not a stub.
+    const dayCardsNow = new Date();
+    function dayCardsLocalTs(daysAgo, hour) {
+      return new Date(dayCardsNow.getFullYear(), dayCardsNow.getMonth(), dayCardsNow.getDate() - daysAgo, hour, 0, 0).toISOString();
+    }
+    let dayCardsSeq = 0;
+    function unitWith(overrides) {
+      overrides = overrides || {};
+      const id = dayCardsSeq++;
+      const ts = overrides.ts !== undefined ? overrides.ts : dayCardsLocalTs(0, 10);
+      const author = overrides.author !== undefined ? overrides.author : 'Marco';
+      const authorId = overrides.authorId; // no default: exercises the author fallback in the key
+      const project = overrides.project !== undefined ? overrides.project : 'ProjA';
+      const projectId = overrides.projectId; // no default: exercises the project fallback in the key
+      const projectPath = overrides.projectPath;
+      const repEntry = Object.prototype.hasOwnProperty.call(overrides, 'repEntry') ? overrides.repEntry : null;
+      const ask = overrides.ask !== undefined ? overrides.ask : 'Do the thing';
+      const entry = { ts, ask, author, authorId };
+      const run = { ts, key: 'run' + id, entries: [entry], rep: repEntry };
+      return {
+        key: 'unit' + id,
+        ts,
+        author, authorId,
+        self: overrides.self !== undefined ? overrides.self : false,
+        source: overrides.source !== undefined ? overrides.source : 'Claude Code',
+        project, projectId, projectPath,
+        agentCount: overrides.agentCount !== undefined ? overrides.agentCount : 1,
+        promptCount: overrides.promptCount !== undefined ? overrides.promptCount : 1,
+        rep: repEntry ? run : null,
+        live: overrides.live !== undefined ? overrides.live : false,
+        runs: overrides.runs !== undefined ? overrides.runs : [run],
+      };
+    }
+    function evalDayCards(units) {
+      const escSrc = extractVarFn(embeddedScript, 'esc') || '';
+      const fnSrc = ['normKeyPart', 'homeDayLabel', 'firstSentence', 'askHeadline', 'runHeadline', 'buildDayCards']
+        .map(n => extractFn(embeddedScript, n)).join('\n');
+      const sandbox = new Function(escSrc + '\n' + fnSrc + '\nreturn { buildDayCards: buildDayCards };')();
+      return sandbox.buildDayCards(units);
+    }
+    const uToday1 = unitWith({ ts: dayCardsLocalTs(0, 14) });
+    const uToday2 = unitWith({ ts: dayCardsLocalTs(0, 9) });
+    const uYesterday = unitWith({ ts: dayCardsLocalTs(1, 14) });
+    const uMarco = unitWith({ author: 'Marco', ts: dayCardsLocalTs(0, 10) });
+    const uAndrew = unitWith({ author: 'Andrew', ts: dayCardsLocalTs(0, 10) });
+    const uMarcoOtherProj = unitWith({ author: 'Marco', project: 'ProjB', ts: dayCardsLocalTs(0, 10) });
+    const liveUnit3prompts = unitWith({ promptCount: 3, agentCount: 2, live: true, ts: dayCardsLocalTs(0, 14) });
+    const staleUnit2prompts = unitWith({ promptCount: 2, agentCount: 1, live: false, ts: dayCardsLocalTs(0, 9) });
+    const big5PromptsDistilled = unitWith({ promptCount: 5, ts: dayCardsLocalTs(0, 14), repEntry: { headline: 'Shipped the big feature' } });
+    big5PromptsDistilled.expectedHeadline = 'Shipped the big feature';
+    const small2PromptsDistilled = unitWith({ promptCount: 2, ts: dayCardsLocalTs(0, 13), repEntry: { headline: 'Small fix' } });
+    small2PromptsDistilled.expectedHeadline = 'Small fix';
+    const tieOldDistilled = unitWith({ promptCount: 4, ts: dayCardsLocalTs(0, 9), repEntry: { headline: 'Older tie headline' } });
+    tieOldDistilled.expectedHeadline = 'Older tie headline';
+    const tieNewDistilled = unitWith({ promptCount: 4, ts: dayCardsLocalTs(0, 15), repEntry: { headline: 'Newer tie headline' } });
+    tieNewDistilled.expectedHeadline = 'Newer tie headline';
+    const liveNoRep = unitWith({ live: true, repEntry: null, ts: dayCardsLocalTs(0, 10) });
+    const staleNoRep = unitWith({ live: false, repEntry: null, ts: dayCardsLocalTs(0, 9) });
+    const staleNoRep2 = unitWith({ live: false, repEntry: null, ts: dayCardsLocalTs(0, 10) });
+    check('dayCards: groups by author+project+local day, newest first', () => {
+      // three units: marco/projA today x2, marco/projA yesterday x1
+      const cards = evalDayCards([uToday1, uToday2, uYesterday]);
+      assert.strictEqual(cards.length, 2);
+      assert.strictEqual(cards[0].units.length, 2, 'today card holds both units');
+      assert.ok(cards[0].ts >= cards[1].ts, 'newest day first');
+    });
+    check('dayCards: same day, different author or project -> separate cards', () => {
+      const cards = evalDayCards([uMarco, uAndrew, uMarcoOtherProj]);
+      assert.strictEqual(cards.length, 3);
+    });
+    check('dayCards: key normalization matches unitKeyOf (case/trim never splits)', () => {
+      const cards = evalDayCards([unitWith({ author: 'Marco ' }), unitWith({ author: 'marco' })]);
+      assert.strictEqual(cards.length, 1);
+    });
+    check('dayCards: counts sum and live ORs across units', () => {
+      const c = evalDayCards([liveUnit3prompts, staleUnit2prompts])[0];
+      assert.strictEqual(c.promptCount, 5);
+      assert.strictEqual(c.sessionCount, liveUnit3prompts.agentCount + staleUnit2prompts.agentCount);
+      assert.strictEqual(c.live, true);
+    });
+    check('dayCards: headline picks highest-promptCount distilled unit, tie -> newer', () => {
+      assert.ok(evalDayCards([big5PromptsDistilled, small2PromptsDistilled])[0]
+        .headline.includes(big5PromptsDistilled.expectedHeadline));
+      assert.ok(evalDayCards([tieOldDistilled, tieNewDistilled])[0]
+        .headline.includes(tieNewDistilled.expectedHeadline));
+    });
+    check('dayCards: no distilled rep -> live "Working…" / finished "N sessions · no summaries shared"', () => {
+      assert.ok(/Working/.test(evalDayCards([liveNoRep])[0].headline));
+      assert.ok(/no summaries shared/.test(evalDayCards([staleNoRep, staleNoRep2])[0].headline));
+    });
+    check('dayCards: pure and total — empty input, bad ts never throw', () => {
+      assert.deepStrictEqual(evalDayCards([]), []);
+      assert.ok(evalDayCards([unitWith({ ts: 'not-a-date' })]).length === 1);
+    });
     // ---- Five Electron-runtime UI bug fixes. No DOM runtime in this suite,
     // so these are source-level presence/shape assertions against the served
     // pageHtml/embeddedScript (both already fully rendered by dashboardPage()). ----
