@@ -23,6 +23,7 @@ const { startServer, teamPayload, teamProjectsPayload, statusPayload, feedPayloa
 const teamsync = require('../lib/teamsync');
 const { createMockSupabase } = require('./mock-supabase');
 const advisorLib = require('../lib/advisor');
+const advisors = require('../lib/advisors');
 const memorydb = require('../lib/memorydb');
 const claudeAdapter = require('../lib/adapters/claude-code');
 const codexAdapter = require('../lib/adapters/codex');
@@ -1752,6 +1753,17 @@ async function main() {
       const userMsg = lastBriefingRequest.messages[0].content;
       assert.ok(userMsg.includes('Andrew') && userMsg.includes('Dana'), 'teammate activity missing from the prompt');
       assert.ok(userMsg.includes('Wire the receipt PDF') || userMsg.includes('Receipts now email a PDF'), 'ask/summary missing');
+    });
+
+    // --- Multi-provider advisor: registry + shared helpers ---
+    check('advisors: registry lists providers and looks them up by id', () => {
+      // TODO(plan Task 5): tighten to deepStrictEqual(ids, ['anthropic','openai','google','local']) once adapters land
+      assert.ok(Array.isArray(advisors.list()));
+      assert.strictEqual(advisors.byId('nope'), null);
+    });
+    check('advisors: extractJson recovers an object from surrounding prose', () => {
+      assert.deepStrictEqual(advisors.extractJson('sure!\n{"a":1,"b":[2,3]}\ndone'), { a: 1, b: [2, 3] });
+      assert.strictEqual(advisors.extractJson('no json here'), null);
     });
   } finally {
     child.kill();
