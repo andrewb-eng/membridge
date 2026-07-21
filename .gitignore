@@ -3,6 +3,7 @@ node_modules/
 .DS_Store
 dist/
 app/lib/
+app/bin/
 
 # web app (Next.js) build + local env
 web/.next/

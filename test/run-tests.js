@@ -164,6 +164,13 @@ async function main() {
   console.log(`MemBridge test suite (fixtures in ${ROOT})\n`);
   setupFixtures();
 
+  check('prepare-app bundles the CLI into app/bin so the packaged asar carries it', () => {
+    const r = spawnSync('node', [path.join(__dirname, '..', 'scripts', 'prepare-app.js')], { encoding: 'utf8' });
+    assert.strictEqual(r.status, 0, `prepare-app failed: ${r.stderr}`);
+    const binned = path.join(__dirname, '..', 'app', 'bin', 'membridge.js');
+    assert.ok(fs.existsSync(binned), 'app/bin/membridge.js not created by prepare-app');
+  });
+
   // --- 1. fresh sync ---
   const r1 = syncOnce();
   const claudeMd = () => read(path.join(proj1, 'CLAUDE.md'));
