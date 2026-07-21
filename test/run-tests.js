@@ -3815,6 +3815,27 @@ async function main() {
       row = mockRS.entries.filter(e => e.session === 'sA')[0];
       assert.strictEqual(row.ask, null, 'scrub did not clear ask');
     });
+    // Fail-closed: on an encrypted team with no usable key, reshareSession must
+    // refuse rather than push a plaintext-only row (which merge-duplicates would
+    // apply while leaving any prior ciphertext — still holding the real prompt —
+    // untouched, and would silently downgrade E2E). crypto:null + encrypt:true
+    // exercises the guard deterministically without touching the OS keychain.
+    await check('teamsync: reshareSession fails closed on an encrypted team without a key', async () => {
+      const rc = util.loadUserConfig();
+      rc.team = { ...(rc.team || {}), encrypt: true };
+      util.saveUserConfig(rc);
+      try {
+        const res = await teamsync.reshareSession(util.getConfig(), projRS, 'sA', true, { creds, crypto: null });
+        assert.strictEqual(res.ok, false, 'reshare should fail closed when it cannot encrypt');
+        assert.ok(/encryption/i.test(res.error || ''), 'error should mention encryption: ' + res.error);
+        const row = mockRS.entries.filter(e => e.session === 'sA')[0];
+        assert.strictEqual(row.ask, null, 'fail-closed must not backfill the prompt in plaintext');
+      } finally {
+        const rc2 = util.loadUserConfig();
+        if (rc2.team) delete rc2.team.encrypt;
+        util.saveUserConfig(rc2);
+      }
+    });
   } finally {
     delete process.env.MEMBRIDGE_TEAM_URL;
     delete process.env.MEMBRIDGE_TEAM_ANON_KEY;
