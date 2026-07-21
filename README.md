@@ -134,12 +134,21 @@ memory committed — or commit it to share AI context with your whole team.
 
 ## Quick start
 
-1. **Install the app** (macOS): download `MemBridge-<version>.dmg` from the
-   [latest release](https://github.com/mmelika/membridge/releases), drag it
-   to Applications, and launch — a bridge icon appears in your menu bar with
-   status, dashboard, pause, and start-at-login. (Builds are unsigned for
-   now: right-click → Open on first launch.) On Windows/Linux, or on a
-   server, use [the CLI](#the-cli) instead.
+1. **Install the app + CLI** (macOS, Apple Silicon) with one command. It
+   downloads the pinned release, installs `MemBridge.app` to `/Applications`
+   and the `membridge` CLI to `/usr/local/bin`, and launches with **no
+   Gatekeeper warning**:
+
+   ```sh
+   curl -fsSL https://membridge.me/install.sh | sh
+   ```
+
+   The app opens with zero prompts — `curl` downloads without the
+   `com.apple.quarantine` flag that triggers Gatekeeper. Installing the CLI
+   into `/usr/local/bin` may ask for your password once. Prefer to read before
+   you run? `curl -fsSL https://membridge.me/install.sh -o install.sh` and
+   inspect it — it verifies the download's SHA-256 before touching your disk.
+   On Intel Macs, Windows, or a server, use [the CLI](#the-cli) via npm instead.
 2. **Watch your own tools sync.** That's the zero-setup core: the Home feed
    fills with your work, and Claude Code and Codex start seeing each
    other's work. No account needed for any of this.
