@@ -193,6 +193,12 @@ async function main() {
     assert.ok(tmpl.includes('__MEMBRIDGE_VERSION__') && tmpl.includes('__MEMBRIDGE_SHA256__'),
       'pin placeholders missing');
   });
+  check('build config ships an arm64 zip with a deterministic name for the installer URL', () => {
+    const pkg = JSON.parse(read(path.join(__dirname, '..', 'package.json')));
+    assert.deepStrictEqual(pkg.build.mac.target, ['zip'], 'mac target should be zip-only');
+    assert.strictEqual(pkg.build.mac.artifactName, 'MemBridge-${version}-${arch}.${ext}',
+      'artifactName must be deterministic so install.sh can build the release URL');
+  });
 
   // --- 1. fresh sync ---
   const r1 = syncOnce();

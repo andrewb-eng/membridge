@@ -45,9 +45,9 @@
     "afterPack": "scripts/afterPack.js",
     "mac": {
       "target": [
-        "dmg",
         "zip"
       ],
+      "artifactName": "MemBridge-${version}-${arch}.${ext}",
       "category": "public.app-category.developer-tools",
       "icon": "app/assets/icon.png"
     },
