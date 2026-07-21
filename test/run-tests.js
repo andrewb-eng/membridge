@@ -3871,6 +3871,69 @@ async function main() {
     }
   }
 
+  // Task 6 (per-session prompt sharing): POST /api/share-session persists the
+  // per-session flag into proj.sharedSessions (authoritative for future
+  // normal pushes) and calls teamsync.reshareSession to retroactively
+  // backfill (share=true) or scrub (share=false) already-synced rows.
+  {
+    const mockSE = createMockSupabase();
+    const MOCK_PORT_SE = 17958, SRV_PORT_SE = 17957;
+    await new Promise(r => mockSE.server.listen(MOCK_PORT_SE, '127.0.0.1', r));
+    process.env.MEMBRIDGE_TEAM_URL = 'http://127.0.0.1:' + MOCK_PORT_SE;
+    process.env.MEMBRIDGE_TEAM_ANON_KEY = 'anon-test';
+    let srvSE;
+    try {
+      const projSE = path.join(ROOT, 'projects', 'share-ep-app');
+      fs.mkdirSync(projSE, { recursive: true });
+      await teamsync.signup(util.getConfig(), 'shareep@test.dev', 'pw-se', 'Sharee');
+      const teamSE = await teamsync.createTeam(util.getConfig(), 'ShareEpTeam');
+      await teamsync.linkProject(util.getConfig(), projSE, teamSE.team_id, 'ShareEpTeam');
+      { const rc = util.loadUserConfig(); if (rc.team) delete rc.team.sharePrompts; util.saveUserConfig(rc); }
+      const seAgo = sec => new Date(Date.now() - sec * 1000).toISOString();
+      const st = util.loadState();
+      st.projects[projSE] = { events: [
+        { ts: seAgo(50), source: 'Claude Code', kind: 'prompt', session: 'sC', text: 'share this prompt' },
+        { ts: seAgo(40), source: 'Claude Code', kind: 'edit', session: 'sC', file: path.join(projSE, 'src', 'c.js') },
+        { ts: seAgo(30), source: 'Distilled', kind: 'summary', session: 'sC', text: 'Did.', goal: 'g', decisions: '', gotchas: '', highlights: [{ file: 'src/c.js', note: 'n' }] },
+      ] };
+      util.saveState(st);
+      await teamsync.syncTeams({ project: projSE }); // unshared push (ask=null)
+      srvSE = startServer(SRV_PORT_SE, { retries: 0 });
+      await waitForHttp('http://127.0.0.1:' + SRV_PORT_SE + '/api/status');
+
+      const on = await httpPost(SRV_PORT_SE, '/api/share-session', { project: projSE, session: 'sC', share: true });
+      await check('server: /api/share-session ON persists the flag and backfills the row', () => {
+        assert.strictEqual(on.ok, true);
+        assert.strictEqual(on.shared, true);
+        const state = util.loadState();
+        const proj = state.projects[projSE] || state.projects[path.resolve(projSE)];
+        assert.ok(proj, 'project missing from state after ON');
+        assert.ok((proj.sharedSessions || []).includes('sC'), 'sharedSessions should include sC after ON');
+        const row = mockSE.entries.filter(e => e.session === 'sC')[0];
+        assert.ok(row, 'row missing after ON');
+        assert.ok(row.ask && /share this prompt/.test(row.ask), 'backfill did not populate ask: ' + JSON.stringify(row.ask));
+      });
+
+      const off = await httpPost(SRV_PORT_SE, '/api/share-session', { project: projSE, session: 'sC', share: false });
+      await check('server: /api/share-session OFF persists the flag and scrubs the row', () => {
+        assert.strictEqual(off.ok, true);
+        assert.strictEqual(off.shared, false);
+        const state = util.loadState();
+        const proj = state.projects[projSE] || state.projects[path.resolve(projSE)];
+        assert.ok(proj, 'project missing from state after OFF');
+        assert.ok(!(proj.sharedSessions || []).includes('sC'), 'sharedSessions should not include sC after OFF');
+        const row = mockSE.entries.filter(e => e.session === 'sC')[0];
+        assert.ok(row, 'row missing after OFF');
+        assert.strictEqual(row.ask, null, 'row ask should be null after OFF');
+      });
+    } finally {
+      if (srvSE) await new Promise(r => srvSE.close(r));
+      mockSE.server.close();
+      delete process.env.MEMBRIDGE_TEAM_URL;
+      delete process.env.MEMBRIDGE_TEAM_ANON_KEY;
+    }
+  }
+
   // Task 8: ship decisions/gotchas to teammates end to end, and pull must
   // survive a backend still missing goal/changes (or any optional column).
   const mockS = createMockSupabase();
