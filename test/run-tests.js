@@ -1328,7 +1328,7 @@ async function main() {
       const agoSrc = extractVarFn(embeddedScript, 'ago') || '';
       const constSrc = ['MONO', 'STALE_GAP', 'BURST_GAP'].map(n => extractConst(embeddedScript, n)).join('\n');
       const fnSrc = [
-        'personColor', 'firstSentence', 'askHeadline', 'runHeadline', 'promptRowsHtml', 'cardCloseHtml', 'shareToggleHtml',
+        'personColor', 'firstSentence', 'askHeadline', 'runHeadline', 'promptCellText', 'promptRowsHtml', 'cardCloseHtml', 'shareToggleHtml',
         'threadHtml', 'unitHtml', 'dayCardHtml',
         'feedKey', 'normKeyPart', 'threadKey', 'buildThreads', 'unitKeyOf', 'finalizeUnit', 'buildUnits',
         'homeDayLabel', 'buildDayCards', 'feedDayGroupHtml',
@@ -1382,7 +1382,7 @@ async function main() {
       const escSrc = extractVarFn(embeddedScript, 'esc') || '';
       const agoSrc = extractVarFn(embeddedScript, 'ago') || '';
       const constSrc = extractConst(embeddedScript, 'MONO');
-      const fnSrc = ['personColor', 'firstSentence', 'askHeadline', 'runHeadline', 'dayDetailHtml']
+      const fnSrc = ['personColor', 'firstSentence', 'askHeadline', 'runHeadline', 'promptCellText', 'shareToggleHtml', 'dayDetailHtml']
         .map(n => extractFn(embeddedScript, n)).join('\n');
       const sandbox = new Function('expandedKeys',
         escSrc + '\n' + agoSrc + '\n' + constSrc + '\nvar catchupExpanded = expandedKeys || {};\n' + fnSrc +
@@ -1427,6 +1427,43 @@ async function main() {
       const h = evalDayDetailHtml(null);
       assert.ok(/data-day-back/.test(h), 'not-found still offers the way back');
       assert.ok(/isn|scrolled|no longer/i.test(h), 'not-found copy missing');
+    });
+    // Regression: the day-cards v2 redesign dropped the per-session share toggle
+    // from the Activity view (it survived only on the project page). It belongs on
+    // the session card in the day-detail level — one card is one session.
+    function selfUnit(overrides) {
+      overrides = overrides || {};
+      const ts = overrides.ts !== undefined ? overrides.ts : dayCardsLocalTs(0, 11);
+      const entry = { ts, ask: overrides.ask, author: 'Marco', self: overrides.entrySelf,
+        session: overrides.session, projectPath: overrides.projectPath, shared: !!overrides.shared };
+      return unitWith({ ts, self: true, author: 'Marco', project: 'ProjA',
+        runs: [{ ts, key: 'run-' + (overrides.session || 'x'), entries: [entry], rep: null }] });
+    }
+    check('dayDetailHtml: restores the per-session share toggle on your own session card', () => {
+      const card = evalDayCards([selfUnit({ ask: 'My own prompt', entrySelf: true, session: 's-self1', projectPath: '/Users/marco/ProjA' })])[0];
+      const h = evalDayDetailHtml(card);
+      assert.ok(/data-share-toggle/.test(h), 'share toggle missing from the day-detail session card');
+      assert.ok(/data-share-session="s-self1"/.test(h), 'toggle not wired to the session id');
+      assert.ok(/Share with team/.test(h), 'unshared toggle should read "Share with team"');
+    });
+    check('dayDetailHtml: an already-shared session card reads "Shared"', () => {
+      const card = evalDayCards([selfUnit({ ask: 'Shared prompt', entrySelf: true, session: 's-self3', projectPath: '/Users/marco/ProjA', shared: true })])[0];
+      const h = evalDayDetailHtml(card);
+      assert.ok(/data-share-on="1"/.test(h) && />Shared</.test(h), 'shared session card should show the on-state toggle');
+    });
+    check("dayDetailHtml: no share toggle on a teammate's session card", () => {
+      const teammate = unitWith({ ts: dayCardsLocalTs(0, 11), self: false, author: 'Andrew', project: 'ProjA',
+        runs: [{ ts: dayCardsLocalTs(0, 11), key: 'run-t1', entries: [{ ts: dayCardsLocalTs(0, 11), ask: 'Their prompt', author: 'Andrew', self: false, session: 's-t1', projectPath: null }], rep: null }] });
+      const h = evalDayDetailHtml(evalDayCards([teammate])[0]);
+      assert.ok(!/data-share-toggle/.test(h), 'teammate card must not expose your share toggle');
+    });
+    // Regression: your own prompt is never gated FROM you — an empty own ask means
+    // capture missed it, never the sharing-implying "(prompt not shared)" label.
+    check('dayDetailHtml: your own empty-ask prompt never reads "(prompt not shared)"', () => {
+      const card = evalDayCards([selfUnit({ ask: '', entrySelf: true, session: 's-self2', projectPath: '/Users/marco/ProjA' })])[0];
+      const h = evalDayDetailHtml(card);
+      assert.ok(h.includes('(no prompt captured)'), 'own uncaptured prompt should read "(no prompt captured)"');
+      assert.ok(!h.includes('(prompt not shared)'), 'own prompt must never read as unshared to yourself');
     });
     check('day route: container, tab, poller, and back handler wired', () => {
       assert.ok(pageHtml.includes('id="view-day"') && pageHtml.includes('id="dayRoot"'), 'day view container missing from the page');
@@ -3036,6 +3073,37 @@ async function main() {
       assert.ok(gated, 'gated null-ask row missing from /api/feed');
       assert.strictEqual(gated.ask, '', `null ask must normalize to '', got: ${JSON.stringify(gated.ask)}`);
     });
+    // Regression: your own UNSHARED session is pushed to the team with a null
+    // ask and returns as a self-authored team row. Left in, it renders a phantom
+    // "(prompt not shared)" duplicate of the local prompt you can already read in
+    // full — "I can't see my own messages". feedPayload must drop the self twin
+    // matching a local entry on (session, ts), keeping the local original intact.
+    const selfLocal = feedTamperRes.entries.find(e => e.origin === 'local' && e.self && e.session && e.ask);
+    check('/api/feed exposes a local self entry to base the phantom-twin test on', () => {
+      assert.ok(selfLocal, 'no local self entry with a session+ask in the feed');
+    });
+    if (selfLocal) {
+      mock.entries.push({
+        ...seedTemplate,
+        id: mock.entries.length + 1,
+        author_id: credsA.userId, author_name: 'Marco',
+        ts: selfLocal.ts, session: selfLocal.session, source: selfLocal.source,
+        ask: null, summary: 'phantom twin: summary only',
+        created_at: new Date(Date.now() + 8000).toISOString(),
+      });
+      const feedPhantomRes = await (await fetch(`${hubBase}/api/feed?limit=50`)).json();
+      check('/api/feed drops the unshared self twin so your own prompt is never masked', () => {
+        const twin = feedPhantomRes.entries.find(e => e.origin === 'team'
+          && e.session === selfLocal.session && e.ts === selfLocal.ts);
+        assert.ok(!twin, 'phantom self team-row survived — it would render a duplicate "(prompt not shared)" row');
+        const localStill = feedPhantomRes.entries.find(e => e.origin === 'local'
+          && e.session === selfLocal.session && e.ts === selfLocal.ts);
+        assert.ok(localStill && localStill.ask, 'your own local prompt must remain visible in full');
+        assert.ok(!JSON.stringify(feedPhantomRes).includes('phantom twin: summary only'),
+          'the dropped twin must not surface at all');
+      });
+    }
+
     const teamFeedTamperRes = await (await fetch(`${hubBase}/api/team/feed?teamId=${team.team_id}&limit=50`)).json();
     check('/api/team/feed re-redacts server-row ask and summary too', () => {
       const body = JSON.stringify(teamFeedTamperRes);
