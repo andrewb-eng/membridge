@@ -43,14 +43,19 @@ const proj2 = path.join(ROOT, 'projects', 'excluded-app');
 const proj3 = path.join(ROOT, 'projects', 'marker-app');
 
 const results = [];
+// Supports both sync and async fn. Sync callers (the vast majority) ignore
+// the return value, exactly as before. Async callers must `await check(...)`
+// so a rejected assertion is recorded as a FAIL instead of becoming an
+// unhandled promise rejection that crashes the whole suite.
 function check(name, fn) {
+  const onOk = () => { results.push([name, null]); console.log(`  ok    ${name}`); };
+  const onErr = err => { results.push([name, err]); console.log(`  FAIL  ${name}\n        ${err.message}`); };
   try {
-    fn();
-    results.push([name, null]);
-    console.log(`  ok    ${name}`);
+    const ret = fn();
+    if (ret && typeof ret.then === 'function') return ret.then(onOk, onErr);
+    onOk();
   } catch (err) {
-    results.push([name, err]);
-    console.log(`  FAIL  ${name}\n        ${err.message}`);
+    onErr(err);
   }
 }
 const jsonl = lines => lines.map(l => JSON.stringify(l)).join('\n') + '\n';
@@ -1753,6 +1758,15 @@ async function main() {
       const userMsg = lastBriefingRequest.messages[0].content;
       assert.ok(userMsg.includes('Andrew') && userMsg.includes('Dana'), 'teammate activity missing from the prompt');
       assert.ok(userMsg.includes('Wire the receipt PDF') || userMsg.includes('Receipts now email a PDF'), 'ask/summary missing');
+    });
+
+    await check('advisors/anthropic: generate returns text + normalized usage', async () => {
+      process.env.MEMBRIDGE_API_BASE = 'http://127.0.0.1:17944'; // existing Anthropic mock
+      const a = advisors.byId('anthropic');
+      const r = await a.generate({ apiKey: GOOD_KEY, model: 'claude-sonnet-5', system: 'sys', prompt: 'hi', schema: null, maxTokens: 200 });
+      assert.ok(r.text && typeof r.text === 'string', 'no text');
+      assert.ok(Number.isFinite(r.usage.input_tokens), 'usage not normalized');
+      assert.strictEqual(a.priceFor('claude-haiku-4-5')[0], 1);
     });
 
     // --- Multi-provider advisor: registry + shared helpers ---
