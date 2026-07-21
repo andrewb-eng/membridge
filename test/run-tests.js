@@ -1821,13 +1821,31 @@ async function main() {
 
     // --- Multi-provider advisor: registry + shared helpers ---
     check('advisors: registry lists providers and looks them up by id', () => {
-      // TODO(plan Task 5): tighten to deepStrictEqual(ids, ['anthropic','openai','google','local']) once adapters land
-      assert.ok(Array.isArray(advisors.list()));
+      assert.deepStrictEqual(advisors.list().map(a => a.id), ['anthropic', 'openai', 'google', 'local']);
+      assert.strictEqual(advisors.byId('openai').label, 'OpenAI (GPT)');
       assert.strictEqual(advisors.byId('nope'), null);
     });
     check('advisors: extractJson recovers an object from surrounding prose', () => {
       assert.deepStrictEqual(advisors.extractJson('sure!\n{"a":1,"b":[2,3]}\ndone'), { a: 1, b: [2, 3] });
       assert.strictEqual(advisors.extractJson('no json here'), null);
+    });
+
+    await check('advisors/local: needs base URL, no schema support, prices unknown', async () => {
+      const a = advisors.byId('local');
+      assert.strictEqual(a.needsBaseUrl, true);
+      assert.strictEqual(a.supportsSchema, false);
+      assert.deepStrictEqual(a.priceFor('anything'), [0, 0]);
+      const noBase = await a.generate({ apiKey: '', baseUrl: '', model: 'llama3.1', system: 's', prompt: 'p', schema: null, maxTokens: 100 });
+      assert.ok(noBase.error && /base URL/i.test(noBase.error), 'should demand a base URL');
+
+      const srv = await startJsonMock(17962, (req, body, send) => {
+        send(200, { choices: [{ message: { content: 'here you go {"summary":"ok","phases":[],"risks":[],"questions":[]}' } }], usage: { prompt_tokens: 3, completion_tokens: 4 } });
+      });
+      try {
+        const r = await a.generate({ apiKey: '', baseUrl: 'http://127.0.0.1:17962/v1', model: 'llama3.1', system: 's', prompt: 'p', schema: null, maxTokens: 100 });
+        assert.ok(r.text.includes('summary'), 'returns raw text');
+        assert.strictEqual(r.usage.input_tokens, 3);
+      } finally { srv.close(); }
     });
   } finally {
     child.kill();
