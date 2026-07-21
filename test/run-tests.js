@@ -1801,6 +1801,24 @@ async function main() {
       } finally { srv.close(); }
     });
 
+    await check('advisors/google: generateContent shape + schema sanitized + usage', async () => {
+      let seen = null;
+      const srv = await startJsonMock(17961, (req, body, send) => {
+        seen = { url: req.url, body };
+        if (req.method === 'GET' && /\/models/.test(req.url)) return send(200, { models: [] });
+        send(200, { candidates: [{ content: { parts: [{ text: '{"summary":"ok","phases":[],"risks":[],"questions":[]}' }] } }], usageMetadata: { promptTokenCount: 12, candidatesTokenCount: 7 } });
+      });
+      try {
+        const a = advisors.byId('google');
+        const schema = { type: 'object', properties: { x: { type: 'string' } }, required: ['x'], additionalProperties: false };
+        const r = await a.generate({ apiKey: 'g-x', baseUrl: 'http://127.0.0.1:17961', model: 'gemini-2.0-flash', system: 's', prompt: 'p', schema, maxTokens: 300 });
+        assert.ok(!JSON.stringify(seen.body.generationConfig.responseSchema).includes('additionalProperties'));
+        assert.strictEqual(seen.body.generationConfig.responseMimeType, 'application/json');
+        assert.strictEqual(r.usage.input_tokens, 12);
+        assert.strictEqual(r.usage.output_tokens, 7);
+      } finally { srv.close(); }
+    });
+
     // --- Multi-provider advisor: registry + shared helpers ---
     check('advisors: registry lists providers and looks them up by id', () => {
       // TODO(plan Task 5): tighten to deepStrictEqual(ids, ['anthropic','openai','google','local']) once adapters land
