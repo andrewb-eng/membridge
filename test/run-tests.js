@@ -17,7 +17,7 @@ process.env.MEMBRIDGE_INTERVAL = '3600'; // daemon ticks once at boot, then stay
 delete process.env.ANTHROPIC_API_KEY; // a real key on the dev machine must not leak into settings tests
 
 const util = require('../lib/util');
-const { syncOnce, filterTrackedSessions } = require('../lib/scan');
+const { syncOnce, filterTrackedSessions, filterScratchpadResidue } = require('../lib/scan');
 const digest = require('../lib/digest');
 const { startServer, teamPayload, teamProjectsPayload, statusPayload, feedPayload, projectDetail, planPayload } = require('../lib/server');
 const teamsync = require('../lib/teamsync');
@@ -189,15 +189,25 @@ async function main() {
     assert.ok(kept.every(e => util.normPath(e.project) === util.normPath(repo)), 'kept events not homed to the repo');
   });
 
-  check('capture: a temp-only session mints no project (all edits dropped)', () => {
-    const container = path.join(ROOT, 'container-cwd'); // e.g. the daemon cwd, tracked
-    fs.mkdirSync(container, { recursive: true });
+  check('capture: filterScratchpadResidue drops pure-scratchpad sessions, keeps mixed & prompt-only', () => {
+    const tmp = '/private/tmp/claude-9/x/scratchpad/a.js';
     const events = [
-      { kind: 'edit', file: '/private/tmp/claude-9/y/scratchpad/z/a.js', project: container, session: 's2' },
+      // s1 pure-scratchpad: temp edit + prompt -> everything dropped (no cwd residue)
+      { kind: 'edit', file: tmp, project: '/AI', session: 's1' },
+      { kind: 'prompt', text: 'scratch work', project: '/AI', session: 's1' },
+      // s2 mixed: temp edit dropped, real edit + prompt kept
+      { kind: 'edit', file: tmp, project: '/repo', session: 's2' },
+      { kind: 'edit', file: '/repo/real.js', project: '/repo', session: 's2' },
+      { kind: 'prompt', text: 'real work', project: '/repo', session: 's2' },
+      // s3 prompt-only (no edits at all) -> untouched
+      { kind: 'prompt', text: 'planning', project: '/repo', session: 's3' },
     ];
-    projectResolve.rehomeEvents(events, new Set([util.normPath(container)]));
-    const kept = filterTrackedSessions(events, new Set([util.normPath(container)]));
-    assert.strictEqual(kept.length, 0, 'a temp-only session should contribute no events');
+    const out = filterScratchpadResidue(events);
+    assert.strictEqual(out.some(e => e.session === 's1'), false, 'pure-scratchpad session residue not dropped');
+    assert.strictEqual(out.some(e => e.file && e.file.includes('scratchpad')), false, 'a temp edit leaked');
+    assert.ok(out.some(e => e.session === 's2' && e.kind === 'prompt'), 's2 prompt lost');
+    assert.ok(out.some(e => e.session === 's2' && e.file === '/repo/real.js'), 's2 real edit lost');
+    assert.ok(out.some(e => e.session === 's3'), 'prompt-only session wrongly dropped');
   });
 
   check('prepare-app bundles the CLI into app/bin so the packaged asar carries it', () => {
