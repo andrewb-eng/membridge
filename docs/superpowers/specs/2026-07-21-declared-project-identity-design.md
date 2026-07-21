@@ -76,8 +76,11 @@ const link = { projectId: b.projectId, teamId: b.teamId || null };
 
 Replace `detectAutoLinks()` (remote matching) with `detectUnboundFolders()`:
 - A candidate is any tracked folder with recent edit events and no resolved binding (not paused, not dismissed).
-- For each, surface a **suggestion** (`proj.bindSuggestion = { candidateProjectId?, prefillFrom: 'remote'|null }`).
-- **Decision 3 pre-fill:** if `repoUrl(key)` matches a backend project's optional `repo_url` metadata, set `candidateProjectId` so the UI shows *"Bind to Membridge? [Yes]"* instead of an empty picker. A non-match just leaves the picker empty. No auto-bind ever happens without a user action.
+- For each, surface a **suggestion** (`proj.bindSuggestion = { candidateProjectId?, prefillFrom: 'remote'|'context'|null }`).
+- **Decision 3 pre-fill — two hint sources, neither ever trusted as truth:**
+  1. **Git remote:** if `repoUrl(key)` matches a backend project's optional `repo_url` metadata, propose that project.
+  2. **Context marker:** MemBridge already writes a managed block into the repo's `CLAUDE.md`/`AGENTS.md`. It also stamps a hidden marker there (`<!-- membridge:project=<id> -->`); if a fresh clone carries one, read it as a second pre-fill source.
+  When a hint resolves, set `candidateProjectId` so the UI shows *"Looks like **Membridge** — bind? [Yes]"* (a one-tap confirm) instead of an empty picker. A missing, stale, or tampered hint simply leaves the picker empty and the user picks. **A hint only pre-selects; the user's confirm is what binds — so a bad marker can never silently connect a folder to the wrong project.**
 
 Keep `resolveSuggestion(accept)` semantics: accept → `bindFolder`; dismiss → remember `bindSuggestionDismissed` for that folder.
 
@@ -112,6 +115,18 @@ On upgrade, for each folder with a committed or existing `.membridge/team.json` 
 - **Integration:** `syncTeams` pushes/pulls for a bound folder and skips an unbound one (against the existing offline mock backend); migration seeds a binding from a legacy `team.json`.
 - **Regression:** a fork-remote folder bound to the shared project pushes to the shared `project_id`, not a new row.
 - Keep the existing suite green (currently 470).
+
+## Alternatives considered
+
+All three share one root: they try to skip the bind click by carrying identity in a **repo artifact** instead of over the sync backend. Each is kept only as an optional *hint* (Delta 3), never as source of truth.
+
+| Alternative | Why not as the mechanism | Kept as |
+|-------------|--------------------------|---------|
+| **Auto-committed `team.json`** | A background daemon committing into users' repos is invasive and unsafe (dirty tree, hooks, signing, protected branches); propagation still rides push/merge/pull, so a new teammate or a fork cut before the commit gets nothing; can't express monorepo granularity; no-git folders can't carry it; bakes a semi-sensitive id permanently into shared/public history. | Manual escape hatch (still supported for the single-shared-repo case). |
+| **Git remote as identity** | Fork remotes differ (the original bug); monorepos collide onto one remote; no-remote folders have no key; robust fork→upstream resolution needs per-host heuristics and auth tokens. | Pre-fill hint. |
+| **Identity in the context injection** (`CLAUDE.md` marker) | Collapses into "committed `team.json` in disguise" — same push/merge/pull propagation lag and same fork/monorepo/no-file gaps — and adds tamper risk (a human-edited doc becomes a control value) plus coupling to the injection format. | Pre-fill hint (second source in Delta 3). |
+
+The decisive reframe: MemBridge already runs a fast, authoritative, git-independent channel — the sync backend. Identity should travel over it (join team → app lists projects → bind once), not be smuggled through repo files that propagate slower and can be stale or edited.
 
 ## Out of scope
 
