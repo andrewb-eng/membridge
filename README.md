@@ -476,7 +476,7 @@ syncs (60s default), and has zero runtime dependencies.
 ```bash
 node test/run-tests.js   # zero-dependency offline suite (temp dirs + mock Supabase)
 npm run app              # run the tray app from source (Electron)
-npm run dist:mac         # build the macOS menu-bar app (dmg + zip)
+npm run dist:mac         # build the macOS menu-bar app (zip; feeds the curl installer)
 ```
 
 The core stays zero-dependency; Electron is a devDependency used only by the
