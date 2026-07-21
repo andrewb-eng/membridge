@@ -981,6 +981,32 @@ async function main() {
       assert.ok(finished.includes('session ended') && finished.includes('no summary shared'), 'finished no-ask placeholder missing');
       assert.ok(!finished.includes('HARVESTED PROSE'), 'harvested text leaked into the headline');
     });
+    // Task 3 (specs/2026-07-20-activity-display-headline): threadHtml/unitHtml
+    // must call runHeadline for their card headline instead of the old inline
+    // three-way ternary that could fall back to repHarvested prose, the
+    // headline div must 2-line-clamp, and the expander must carry the FULL
+    // brief (summaryFull || summary) that the clamp pushed out of the headline.
+    check('cards: headline uses runHeadline and never repHarvested; headline clamps; expander carries full brief', () => {
+      const th = extractFn(embeddedScript, 'threadHtml');
+      const uh = extractFn(embeddedScript, 'unitHtml');
+      assert.ok(/runHeadline\(/.test(th) && /runHeadline\(/.test(uh), 'cards do not call runHeadline');
+      assert.ok(!/repHarvested\)\s*\?/.test(th) && !/repHarvested\)\s*\?/.test(uh), 'repHarvested still in a headline ternary');
+      assert.ok(/-webkit-line-clamp:2/.test(th), 'threadHtml headline is not 2-line clamped');
+      assert.ok(/-webkit-line-clamp:2/.test(uh), 'unitHtml headline is not 2-line clamped');
+      assert.ok(/summaryFull \|\| t\.rep\.summary/.test(th) || /t\.rep\.summaryFull \|\| t\.rep\.summary/.test(th), 'threadHtml expander missing full-brief fallback');
+      assert.ok(/fd-label/.test(th) && /fd-label/.test(uh), 'expander missing a Summary label block');
+      // The per-run agent-thread label inside unitHtml (the u.runs map, `rlabel`)
+      // is a third headline/label site — same ban applies.
+      assert.ok(!/r\.repHarvested\s*\?/.test(uh), 'per-run agent-thread label still falls back to r.repHarvested');
+      // subagentLine (the one-line label for a subagent run shown in the
+      // session detail page's per-prompt dropdown) is a fourth headline/label
+      // site found by grepping repHarvested — it must route through
+      // runHeadline too, never returning raw harvested prose.
+      const sub = extractFn(embeddedScript, 'subagentLine');
+      assert.ok(sub, 'subagentLine not found');
+      assert.ok(/runHeadline\(/.test(sub), 'subagentLine does not call runHeadline');
+      assert.ok(!/repHarvested/.test(sub), 'subagentLine still references repHarvested');
+    });
     // ---- Five Electron-runtime UI bug fixes. No DOM runtime in this suite,
     // so these are source-level presence/shape assertions against the served
     // pageHtml/embeddedScript (both already fully rendered by dashboardPage()). ----
