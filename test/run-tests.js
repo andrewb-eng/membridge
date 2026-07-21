@@ -1847,6 +1847,38 @@ async function main() {
         assert.strictEqual(r.usage.input_tokens, 3);
       } finally { srv.close(); }
     });
+
+    // --- Task 6: advisor.js delegates to provider adapters ---
+    check('advisor: getAdvisorConfig migrates legacy anthropic key + reads providers', () => {
+      let cfg = { advisor: { apiKey: 'sk-legacy', model: 'claude-opus-4-8' } };
+      let a = advisorLib.getAdvisorConfig(cfg);
+      assert.strictEqual(a.provider, 'anthropic');
+      assert.strictEqual(a.apiKey, 'sk-legacy');
+      assert.strictEqual(a.model, 'claude-opus-4-8');
+      assert.strictEqual(a.baseUrl, '');
+      cfg = { advisor: { provider: 'openai', providers: { openai: { apiKey: 'sk-oai', model: 'gpt-4o' } } } };
+      a = advisorLib.getAdvisorConfig(cfg);
+      assert.strictEqual(a.provider, 'openai');
+      assert.strictEqual(a.apiKey, 'sk-oai');
+      assert.strictEqual(a.model, 'gpt-4o');
+      cfg = { advisor: { provider: 'local', providers: { local: { baseUrl: 'http://h/v1', model: 'llama3.1' } } } };
+      a = advisorLib.getAdvisorConfig(cfg);
+      assert.strictEqual(a.provider, 'local');
+      assert.strictEqual(a.baseUrl, 'http://h/v1');
+      assert.strictEqual(a.model, 'llama3.1');
+    });
+    await check('advisor: generatePlan routes to the selected provider', async () => {
+      const srv = await startJsonMock(17963, (req, body, send) => {
+        if (req.method === 'GET') return send(200, { data: [] });
+        send(200, { choices: [{ message: { content: '{"summary":"S","phases":[],"risks":[],"questions":[]}' } }], usage: { prompt_tokens: 8, completion_tokens: 9 } });
+      });
+      try {
+        const r = await advisorLib.generatePlan('sk-oai', 'gpt-4o', { projectName: 'p', goal: 'g', recentAsks: [] }, { provider: 'openai', baseUrl: 'http://127.0.0.1:17963/v1' });
+        assert.strictEqual(r.ok, true);
+        assert.strictEqual(r.plan.summary, 'S');
+        assert.ok(r.costUsd >= 0);
+      } finally { srv.close(); }
+    });
   } finally {
     child.kill();
     await new Promise(r => mockApi.close(r));
