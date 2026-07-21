@@ -42,8 +42,12 @@ if [ "$DRY_RUN" != 1 ]; then
 fi
 
 # 4. Quit any running instance so the bundle can be replaced
-osascript -e "quit app \"${APP_NAME}\"" >/dev/null 2>&1 || true
-pkill -f "${APP_NAME}.app/Contents/MacOS/${APP_NAME}" >/dev/null 2>&1 || true
+if [ "$DRY_RUN" = 1 ]; then
+  printf '  [dry-run] quit + kill any running %s\n' "$APP_NAME"
+else
+  osascript -e "quit app \"${APP_NAME}\"" >/dev/null 2>&1 || true
+  pkill -f "${APP_NAME}.app/Contents/MacOS/${APP_NAME}" >/dev/null 2>&1 || true
+fi
 
 # 5. Install the app
 say "Installing to ${APP_DEST}..."
