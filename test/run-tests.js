@@ -946,6 +946,21 @@ async function main() {
       assert.ok(status.projectCount >= 1, 'no projects reported');
       assert.ok(status.adapters.includes('Claude Code') && status.adapters.includes('MyTool'), 'adapters missing');
     });
+    // The dashboard needs a visible E2E signal (the whole point of "how does a
+    // user SEE encryption is on"). statusPayload surfaces the state the header
+    // badge renders: enabled (default-on unless the explicit hatch), whether
+    // sync is paused fail-closed, and any outstanding key alerts. Asserted
+    // in-process (not over HTTP) so a stale daemon squatting the test port
+    // can't mask the new fields — see the port-squat memory.
+    check('statusPayload surfaces encryption state for the header badge', () => {
+      const enc = statusPayload().encryption;
+      assert.ok(enc && typeof enc === 'object', 'encryption block missing');
+      // This home runs the encrypt:false legacy hatch (setupFixtures).
+      assert.strictEqual(enc.enabled, false, 'legacy hatch home must report encryption disabled');
+      assert.strictEqual(enc.paused, null, 'no pause expected');
+      assert.strictEqual(enc.keyAlerts, 0, 'no key alerts expected');
+      assert.strictEqual(typeof enc.plaintextOff, 'boolean', 'plaintextOff must be present');
+    });
     const page = await fetch(base);
     const pageHtml = await page.text();
     check('dashboard page serves 200 html', () => {
