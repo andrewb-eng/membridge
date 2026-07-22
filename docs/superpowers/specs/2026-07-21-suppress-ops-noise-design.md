@@ -195,11 +195,11 @@ Render / share (all use classify.js)
 - `runStop` already fails open (any throw → allow the stop, log). The new
   zero-edit branch stays inside that try/catch — a bad prompt count or missing
   field must never trap a session.
-- The render/push/inbound filters must fail open toward **showing** on
-  malformed input for local edit/distilled signals? No — they fail toward the
-  safe default of the predicate: a session with no resolvable events is not
-  shareable and is omitted. Filters must never throw; a defensive guard treats
-  unclassifiable input as non-shareable and moves on.
+- The render/push/inbound filters must never throw. On malformed or
+  unclassifiable input the predicate's safe default applies: a session with no
+  resolvable `edit` or distilled-`summary` event is treated as **not
+  shareable** and omitted. A defensive guard around each filter drops the
+  offending entry rather than failing the whole assembly.
 
 ## Testing (`test/run-tests.js`)
 
