@@ -1636,6 +1636,17 @@ async function main() {
       const h = evalDayDetailHtml(dDetailCard);
       assert.ok(h.includes('Did the thing end to end. Wired the tests. Landed green.'), 'full distilled summary missing');
     });
+    // FIX 3 (auto/day-card-fixes): a teammate's summary is harvested (never
+    // distilled over sync), so the day-detail card used to drop it and show only
+    // the clamped ask. It must fall back to the harvested rep — same rule the
+    // day-card checklist uses — and render the FULL summary.
+    check('dayDetailHtml: a teammate\'s full summary renders (harvested fallback), not just the clamped ask', () => {
+      const teammate = unitWith({ self: false, author: 'Andrew', ts: dayCardsLocalTs(0, 11), ask: 'refactor auth',
+        harvestedEntry: { summary: 'Refactored the auth module across three files. Added tests. All green now.' } });
+      const h = evalDayDetailHtml(evalDayCards([teammate])[0]);
+      assert.ok(h.includes('Refactored the auth module across three files. Added tests. All green now.'),
+        'teammate harvested summary must render in full in the day-detail card');
+    });
     check('dayDetailHtml: prompts hidden behind the bottom-left toggle; display-only rows; no level-3 target', () => {
       const h = evalDayDetailHtml(dDetailCard);
       assert.ok(/data-prompts-toggle/.test(h), 'prompts toggle missing');
