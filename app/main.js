@@ -4,7 +4,7 @@
 // the CLI daemon — the app shell is just a face on it.
 const fs = require('fs');
 const path = require('path');
-const { app, Tray, Menu, BrowserWindow, nativeImage, dialog } = require('electron');
+const { app, Tray, Menu, BrowserWindow, nativeImage, dialog, shell } = require('electron');
 
 // lib/ is copied into app/lib by scripts/prepare-app.js (packaged builds);
 // fall back to ../lib when running straight from the repo.
@@ -108,6 +108,32 @@ function openDashboard() {
   });
 }
 
+// Notify (once per version) when a newer release exists. Best-effort and
+// fail-silent — never blocks startup. MemBridge has no in-app auto-updater
+// (that would need an Apple Developer signature), so we point the user at the
+// one-line installer instead of updating for them.
+async function checkForUpdate() {
+  try {
+    const updateCheck = lib('update-check');
+    const r = await updateCheck.check({ current: app.getVersion() });
+    if (!r.updateAvailable || updateCheck.alreadyNotified(r.latest)) return;
+    updateCheck.markNotified(r.latest);
+    const command = updateCheck.updateCommand('app');
+    const { response } = await dialog.showMessageBox({
+      type: 'info',
+      title: 'Update available',
+      message: 'A new version of MemBridge is available.',
+      detail: `You're on v${r.current}. The latest is v${r.latest}.\n\nTo update, run this in your terminal:\n  ${command}`,
+      buttons: ['Get the update', 'Later'],
+      defaultId: 0,
+      cancelId: 1,
+    });
+    if (response === 0) shell.openExternal(updateCheck.RELEASES_PAGE);
+  } catch {
+    // an update check must never take the app down
+  }
+}
+
 function updateMenu() {
   if (!tray) return;
   let projects = 0;
@@ -181,6 +207,8 @@ if (!gotLock) {
     if (!SMOKE) {
       tick();
       setInterval(tick, config.intervalSec * 1000);
+      // Fire-and-forget: notify once per version if a newer release exists.
+      checkForUpdate();
     }
 
     if (SMOKE) {

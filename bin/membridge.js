@@ -279,6 +279,45 @@ async function cmdMcp() {
   await require('../lib/mcp').startMcpServer();
 }
 
+// `membridge update` — check GitHub for a newer release and update in place.
+// `--check` only reports (never runs anything). For npm installs we run the
+// upgrade inline; for the macOS app we PRINT the one-liner instead of running
+// it, because the installer quits and replaces the very app whose runtime is
+// executing this command — that must happen in the user's own terminal.
+async function cmdUpdate() {
+  const updateCheck = require('../lib/update-check');
+  console.log('Checking for updates…');
+  const r = await updateCheck.check({ force: true });
+  if (!r.latest) {
+    console.log(`Couldn't reach the update server (offline or rate-limited). You're on v${r.current}.`);
+    return;
+  }
+  if (!r.updateAvailable) {
+    console.log(`You're on the latest version (v${r.current}).`);
+    return;
+  }
+  const kind = updateCheck.installKind();
+  const command = updateCheck.updateCommand(kind);
+  console.log(`Update available: v${r.current} → v${r.latest}\n`);
+  if (flag('--check')) {
+    console.log(`Update with:\n  ${command}`);
+    return;
+  }
+  if (kind === 'app') {
+    // Auto-running the installer here would pkill this process mid-run.
+    console.log('This is the macOS app. Run this in your terminal to update');
+    console.log('(it quits MemBridge, swaps the app, and relaunches):\n');
+    console.log(`  ${command}\n`);
+    return;
+  }
+  console.log(`Updating via: ${command}\n`);
+  const res = spawnSync('npm', ['install', '-g', 'membridge'], { stdio: 'inherit' });
+  if (res.status !== 0) {
+    die(`Update failed (exit ${res.status}). Run it manually:\n  ${command}`);
+  }
+  console.log(`\nUpdated to v${r.latest}. Restart the daemon if it was running: membridge start`);
+}
+
 // File-level provenance: which AI sessions (yours and teammates') edited a
 // file, newest first. Works from any subdirectory — the file argument is
 // resolved against cwd, then walked up to the nearest tracked project root.
@@ -662,6 +701,8 @@ Usage: membridge <command>
   remove [--project <path>]             strip injected memory blocks
   enable-autostart    launch MemBridge automatically at login
   disable-autostart   remove the login launcher
+  update [--check]    check for a newer release and update in place
+                      (--check only reports; never runs anything)
   daemon              run in the foreground (used internally / by services)
   help                this text
 
@@ -719,6 +760,7 @@ const commands = {
   status: cmdStatus,
   remove: cmdRemove,
   dashboard: cmdDashboard,
+  update: cmdUpdate,
   mcp: cmdMcp,
   signup: cmdSignup,
   login: cmdLogin,

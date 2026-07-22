@@ -9444,6 +9444,72 @@ async function main() {
     });
   }
 
+  // --- update check (version compare + cached, fail-silent release lookup) ---
+  {
+    const uc = require('../lib/update-check');
+    const clearCache = () => { try { fs.unlinkSync(uc.cachePath()); } catch {} };
+    const mkFetch = tag => async () => ({ ok: true, json: async () => ({ tag_name: tag }) });
+    const failFetch = () => async () => { throw new Error('offline'); };
+
+    check('update-check: parseVersion + numeric (not lexical) compare', () => {
+      assert.deepStrictEqual(uc.parseVersion('v1.2.3'), [1, 2, 3]);
+      assert.deepStrictEqual(uc.parseVersion('1.2'), [1, 2, 0]);
+      assert.strictEqual(uc.parseVersion('garbage'), null);
+      assert.ok(uc.compareVersions('0.1.10', '0.1.9') > 0, '0.1.10 must beat 0.1.9');
+      assert.ok(uc.compareVersions('1.0.0', '0.9.9') > 0);
+      assert.strictEqual(uc.isNewer('0.1.1', '0.1.1'), false);
+      assert.strictEqual(uc.isNewer('0.1.0', '0.1.1'), false);
+    });
+
+    await check('update-check: reports an available update from the API', async () => {
+      clearCache();
+      const r = await uc.check({ current: '0.1.1', force: true, now: 1000, fetchImpl: mkFetch('v0.2.0') });
+      assert.strictEqual(r.latest, '0.2.0');
+      assert.strictEqual(r.updateAvailable, true);
+    });
+
+    await check('update-check: no update when already on latest', async () => {
+      clearCache();
+      const r = await uc.check({ current: '0.2.0', force: true, now: 1000, fetchImpl: mkFetch('v0.2.0') });
+      assert.strictEqual(r.updateAvailable, false);
+    });
+
+    await check('update-check: offline is fail-silent (null latest, no throw)', async () => {
+      clearCache();
+      const r = await uc.check({ current: '0.1.1', force: true, now: 1000, fetchImpl: failFetch() });
+      assert.strictEqual(r.latest, null);
+      assert.strictEqual(r.updateAvailable, false);
+    });
+
+    await check('update-check: TTL caches the result; force bypasses it', async () => {
+      clearCache();
+      let calls = 0;
+      const counting = async () => { calls++; return { ok: true, json: async () => ({ tag_name: 'v0.3.0' }) }; };
+      await uc.check({ current: '0.1.1', now: 1000, fetchImpl: counting });      // fetch #1
+      await uc.check({ current: '0.1.1', now: 2000, fetchImpl: counting });      // within TTL -> cached
+      assert.strictEqual(calls, 1, 'second call within TTL must not re-fetch');
+      await uc.check({ current: '0.1.1', now: 3000, force: true, fetchImpl: counting }); // force -> re-fetch
+      assert.strictEqual(calls, 2, 'force must re-fetch');
+      // ...and past the TTL it re-fetches on its own.
+      await uc.check({ current: '0.1.1', now: 3000 + uc.CACHE_TTL_MS + 1, fetchImpl: counting });
+      assert.strictEqual(calls, 3, 'a check past the TTL must re-fetch');
+    });
+
+    check('update-check: once-per-version notification guard', () => {
+      clearCache();
+      assert.strictEqual(uc.alreadyNotified('0.2.0'), false);
+      uc.markNotified('0.2.0');
+      assert.strictEqual(uc.alreadyNotified('0.2.0'), true);
+      assert.strictEqual(uc.alreadyNotified('0.3.0'), false, 'a newer version must notify again');
+      clearCache();
+    });
+
+    check('update-check: updateCommand matches install kind', () => {
+      assert.strictEqual(uc.updateCommand('app'), 'curl -fsSL https://membridge.me/install.sh | sh');
+      assert.strictEqual(uc.updateCommand('npm'), 'npm install -g membridge');
+    });
+  }
+
   // --- summary ---
   const failed = results.filter(([, e]) => e);
   console.log(`\n${results.length - failed.length}/${results.length} checks passed`);
