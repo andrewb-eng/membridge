@@ -1,8 +1,36 @@
 # Suppress Ops Noise, Distill the Substance
 
 **Date:** 2026-07-21
-**Status:** Approved (design)
+**Status:** SUPERSEDED — see "Final design as shipped" below
 **Branch:** `feat/suppress-ops-noise`
+
+> ## Final design as shipped (2026-07-22)
+>
+> During implementation the design was simplified per the owner's direction:
+> **"if a session doesn't make any edits it shouldn't show up in MemBridge."**
+>
+> - **Single rule:** a session is shown/pushed only if it made file edits.
+>   Predicate lives in `lib/classify.js` (`shareableSessions` /
+>   `isShareableLocal` / `filterShareableEntries`).
+> - **Codex exemption (critical):** the Codex adapter never emits `edit` events,
+>   so a literal edit rule would hide all Codex work. A source counts as
+>   "edit-capturing" once it has emitted ≥1 edit in the project; only such
+>   tools' zero-edit sessions are suppressed. Codex (and any edit-less custom
+>   adapter) is always shown. Self-calibrating, adapter-agnostic.
+> - **No zero-edit distillation.** The "rescue substantive zero-edit diagnoses"
+>   half was dropped — a distilled diagnosis with no edits still won't show, so
+>   there is nothing to distill. `hooks.js`/`util.js` are unchanged.
+> - **No inbound filter.** The rule is enforced on the emitting machine (feed +
+>   block + push), so a teammate never receives a zero-edit session. No DB
+>   migration, no `distilled`-based inbound gate.
+> - **Call sites:** `server.js` feedPayload (feed), `teamsync.js`
+>   pushProject + reshareSession (push), `digest.js` sessionGroups (block).
+> - 567/567 tests pass.
+>
+> The sections below are the earlier (distillation + inbound) design, kept for
+> history. They do NOT reflect the shipped code.
+>
+> ---
 
 ## Problem
 

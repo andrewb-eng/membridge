@@ -1,5 +1,14 @@
 # Suppress Ops Noise, Distill the Substance — Implementation Plan
 
+> **SUPERSEDED (2026-07-22).** The shipped implementation is simpler than this
+> plan. The rule became "a session with no edits doesn't show" — no zero-edit
+> distillation (Tasks 2 dropped), no inbound filter (Task 5 dropped), and a
+> Codex exemption was added (a source is only judged by edits once it has
+> emitted ≥1 edit, so Codex — which never emits edits — is always shown). What
+> shipped: `lib/classify.js` (pure predicate) wired into `server.js` (feed),
+> `teamsync.js` (push), and `digest.sessionGroups` (block). See the spec's
+> "Final design as shipped" note. This plan is kept for history only.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Stop rendering/sharing zero-edit "ops" sessions (browser, ad-gen, tool wrangling) while distilling substantive zero-edit sessions (diagnoses, decisions) so they render as a clean one-liner instead of raw harvest.
