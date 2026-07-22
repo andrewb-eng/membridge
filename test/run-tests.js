@@ -5833,6 +5833,7 @@ async function main() {
       fs.mkdirSync(projT, { recursive: true });
       const kcDana = mkMemKeychain(), kcEve = mkMemKeychain();
       let tErr = null, eveEntriesClosed = null, eveEntriesHatch = null, resEveClosed = null, feedEve = null;
+      let fpEve = null, trustRes = null, pinsAfterTrust = null, danaId = null, danaNewPub = null;
       try {
         await new Promise(r => mockT.server.listen(17955, '127.0.0.1', r));
         process.env.MEMBRIDGE_TEAM_URL = 'http://127.0.0.1:17955';
@@ -5900,6 +5901,16 @@ async function main() {
         rawE2.team = { ...(rawE2.team || {}), encrypt: true };
         util.saveUserConfig(rawE2);
         feedEve = await feedPayload({ limit: 50, cryptoDeps: { keychain: kcEve, teamcrypto: tcE2E } });
+
+        // CLI surface (E2E completion Task 7): fingerprint report from Eve's
+        // keychain + pins, then a deliberate trust re-pin after Dana rotates
+        // her published key (the only path that ever replaces a pin).
+        fpEve = await teamsync.fingerprintReport({ cryptoDeps: { keychain: kcEve, teamcrypto: tcE2E } });
+        danaId = mockT.users.get('dana-e2e@test.dev').id;
+        danaNewPub = tcE2E.genKeypair().publicKey;
+        mockT.pubkeys.set(danaId, danaNewPub);
+        trustRes = await teamsync.trustMember(util.getConfig(), 'Dana', { cryptoDeps: { teamcrypto: tcE2E } });
+        pinsAfterTrust = require('../lib/teampins').load();
       } catch (e) { tErr = e; } finally {
         process.env.MEMBRIDGE_HOME = savedHome;
         process.env.MEMBRIDGE_TEAM_URL = savedUrl2;
@@ -5933,6 +5944,25 @@ async function main() {
           `fresh encrypted row must decrypt in the feed, got: ${JSON.stringify(feedEve.entries.map(e => ({ ask: e.ask, undecryptable: e.undecryptable })))}`);
         assert.ok(feedEve.entries.some(e => e.undecryptable === true),
           'corrupted rows must carry the undecryptable marker through normalizeTeam');
+      });
+
+      check('teamsync: fingerprintReport shows my key and every pinned teammate in the human-readable format', () => {
+        assert.ok(!tErr, `tamper scenario threw: ${tErr && tErr.message}`);
+        assert.ok(fpEve && fpEve.ok, `report failed: ${fpEve && fpEve.error}`);
+        assert.match(fpEve.mine, /^[0-9a-f]{4}( [0-9a-f]{4}){7}$/, 'own fingerprint format');
+        const dana = fpEve.members.find(m => m.name === 'Dana');
+        assert.ok(dana, `Dana must be pinned, members: ${JSON.stringify(fpEve.members)}`);
+        assert.match(dana.fingerprint, /^[0-9a-f]{4}( [0-9a-f]{4}){7}$/, 'teammate fingerprint format');
+      });
+
+      check('teamsync: trustMember re-pins a rotated key, reporting old and new fingerprints', () => {
+        assert.ok(!tErr, `tamper scenario threw: ${tErr && tErr.message}`);
+        assert.ok(trustRes && trustRes.ok, `trust failed: ${trustRes && trustRes.error}`);
+        assert.strictEqual(trustRes.userId, danaId, 'display-name lookup must resolve to the user id');
+        assert.ok(trustRes.previous && trustRes.current && trustRes.previous !== trustRes.current,
+          'old and new fingerprints must both be reported and differ');
+        assert.strictEqual(pinsAfterTrust[danaId].publicKey, danaNewPub,
+          'the pin must now hold the rotated key');
       });
     }
 

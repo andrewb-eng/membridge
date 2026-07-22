@@ -212,6 +212,12 @@ function cmdStatus() {
   console.log(`Autostart: ${autostart.isEnabled() ? 'enabled' : 'disabled'}`);
   const distillOn = !config.distill || config.distill.enabled !== false;
   console.log(`Distill:   ${distillOn ? 'enabled' : 'disabled'} — Claude Code hook ${hooks.isHookInstalled() ? 'installed' : 'not installed (run \`membridge setup-hooks\`)'}`);
+  const encOn = ((config.team || {}).encrypt !== false);
+  const keyAlerts = Array.isArray(state.keyAlerts) ? state.keyAlerts.length : 0;
+  let encLine = encOn ? 'on (E2E, fail-closed)' : 'OFF — plaintext sync (explicit team.encrypt=false hatch)';
+  if (encOn && state.teamCryptoPaused) encLine += ` — PAUSED: ${state.teamCryptoPaused}`;
+  if (keyAlerts) encLine += ` — ${keyAlerts} KEY ALERT(S): verify with \`membridge team fingerprint\`, then \`membridge team trust\``;
+  console.log(`Encrypt:   ${encLine}`);
   const projects = Object.entries(state.projects || {});
   console.log(`Projects:  ${projects.length}`);
   for (const [key, proj] of projects) {
@@ -497,8 +503,33 @@ async function cmdTeam() {
     return;
   }
 
+  // Key fingerprints for out-of-band verification (E2E). Purely local: your
+  // own key from the keychain, teammates' from the TOFU pin store.
+  if (sub === 'fingerprint') {
+    const r = await teamsync.fingerprintReport();
+    if (!r.ok) die(r.error);
+    console.log(`Your key:   ${r.mine || '(no identity yet — created on the first team sync)'}`);
+    if (!r.members.length) console.log('No teammate keys pinned yet.');
+    for (const m of r.members) console.log(`  ${m.name || m.userId}:  ${m.fingerprint}`);
+    console.log('Compare these with your teammate over a trusted channel (a call, in person) — never through the synced backend itself.');
+    return;
+  }
+
   if (!teamsync.isConfigured(config)) {
     die('Team sync is not available in this build. If you are building MemBridge yourself, an operator must fill lib/backend.json (see the Team sync section of the README); or point at your own backend with `membridge team setup`.');
+  }
+
+  // Deliberate re-pin after an out-of-band fingerprint check — the only way
+  // a changed teammate key is ever accepted.
+  if (sub === 'trust') {
+    const needle = args[2];
+    if (!needle) die('Usage: membridge team trust <user-id or display name>\n(Only after verifying fingerprints out-of-band — `membridge team fingerprint` on both machines.)');
+    const r = await teamsync.trustMember(config, needle);
+    if (!r.ok) die(r.error);
+    console.log(`Re-pinned ${r.name || r.userId}.`);
+    if (r.previous) console.log(`  old: ${r.previous}`);
+    console.log(`  new: ${r.current}`);
+    return;
   }
 
   if (sub === 'create') {
@@ -599,7 +630,7 @@ async function cmdTeam() {
     return;
   }
 
-  die(`Unknown team subcommand: ${sub}\nUsage: membridge team <setup|create|invite|revoke-invite|join|link|unlink|list|share-prompts>`);
+  die(`Unknown team subcommand: ${sub}\nUsage: membridge team <setup|create|invite|revoke-invite|join|link|unlink|list|share-prompts|fingerprint|trust>`);
 }
 
 // ---------------------------------------------------------------------------
