@@ -5347,16 +5347,12 @@ async function main() {
       kNoId = await teamsync.resolveTeamKey(null, 1, mkKeyFakes().deps);
     } catch (e) { tkErr = e; }
 
-    check('teamsync: resolveTeamKey with no sealed row mints one key and inserts one sealed row per member', () => {
+    check('teamsync: resolveTeamKey (pull side) with no sealed row fails closed — never mints', () => {
       assert.ok(!tkErr, `resolveTeamKey threw: ${tkErr && tkErr.message}`);
-      assert.strictEqual(kMint, 'RAWKEY1');
-      assert.strictEqual(mint.calls.gen, 1, 'expected exactly one team-key generation');
+      assert.strictEqual(kMint, null, 'an epoch I was never sealed into is unreadable, full stop');
+      assert.strictEqual(mint.calls.gen, 0, 'pull-side resolution must never generate a key');
       assert.deepStrictEqual(mint.calls.fetchRowEpochs, [3], 'fetchMySealedRow must receive the epoch');
-      assert.strictEqual(mint.calls.inserts.length, 1, 'expected exactly one insert call');
-      assert.deepStrictEqual(mint.calls.inserts[0], [
-        { team_id: 'team-mint', epoch: 3, member_user_id: 'u-a', sealed_team_key: 'SEALED(RAWKEY1->PUB-A)' },
-        { team_id: 'team-mint', epoch: 3, member_user_id: 'u-b', sealed_team_key: 'SEALED(RAWKEY1->PUB-B)' },
-      ], 'one row per member, sealed to that member\'s pubkey');
+      assert.strictEqual(mint.calls.inserts.length, 0, 'pull-side resolution must never insert');
     });
 
     check('teamsync: resolveTeamKey with an existing sealed row unseals it — no generation, no insert', () => {
@@ -5385,6 +5381,151 @@ async function main() {
       assert.strictEqual(kOff, null, 'unavailable crypto must return null');
       assert.strictEqual(noCrypto.calls.fetchRow, 0, 'unavailable crypto must not fetch');
       assert.strictEqual(kNoId, null, 'missing identity must return null');
+    });
+  }
+
+  // Current-key resolution (E2E completion Task 3): epoch discovery from the
+  // team-wide key rows, rotation when membership shrank, join-seal for members
+  // missing at the current epoch, continuous TOFU gating of every seal target,
+  // and lost mint races resolved by reading back my own sealed row. The fake
+  // seal is a reversible string encoding (S(KEY->PUB)) so a concurrent
+  // winner's key can round-trip without real crypto.
+  {
+    const teampins2 = require('../lib/teampins');
+    const mkCur = (opts = {}) => {
+      const calls = { rowFetches: 0, inserts: [], gen: 0, alerts: [], myRowEpochs: [] };
+      let stored = opts.rows ? opts.rows.slice() : [];
+      const pinsBox = { pins: opts.pins ? { ...opts.pins } : {} };
+      return {
+        calls, pinsBox,
+        deps: {
+          teamId: opts.teamId || 'team-cur', userId: 'me', cache: opts.cache,
+          teamcrypto: {
+            available: () => true, ready: async () => {},
+            genTeamKey: () => 'RAW' + (++calls.gen),
+            sealTeamKey: (key, pub) => `S(${key}->${pub})`,
+            unsealTeamKey: sealed => { const m = /^S\((.+?)->/.exec(sealed || ''); return m ? m[1] : null; },
+          },
+          pins: { load: () => pinsBox.pins, save: p => { pinsBox.pins = p; }, check: teampins2.check },
+          onAlert: a => calls.alerts.push(...a),
+          fetchTeamKeyRows: async () => { calls.rowFetches++; return stored.map(r => ({ ...r })); },
+          fetchMembers: async () => opts.members || [],
+          fetchMemberPubkeys: async () => opts.pubkeys || [],
+          fetchMySealedRow: async epoch => {
+            calls.myRowEpochs.push(epoch);
+            const mine = stored.find(r => r.epoch === epoch && r.member_user_id === 'me');
+            if (mine) return mine;
+            // A concurrent minter won the insert race: read-back sees THEIR
+            // key sealed to me, not the rows this client tried to write.
+            if (opts.raceWinnerKey) return { sealed_team_key: `S(${opts.raceWinnerKey}->MYPUB)` };
+            return null;
+          },
+          insertSealedRows: async rows => {
+            calls.inserts.push(rows);
+            if (!opts.dropInserts) stored = stored.concat(rows);
+          },
+        },
+      };
+    };
+    const me = { user_id: 'me', public_key: 'MYPUB', display_name: 'Me' };
+    const bob = { user_id: 'u-b', public_key: 'PUB-B', display_name: 'Bob' };
+    const idc = { publicKey: 'MYPUB', privateKey: 'MYPRIV' };
+    const membersOf = list => list.map(m => ({ user_id: m.user_id, display_name: m.display_name }));
+    const pubsOf = list => list.map(m => ({ user_id: m.user_id, public_key: m.public_key }));
+    const bothRows = [
+      { epoch: 1, member_user_id: 'me', sealed_team_key: 'S(K1->MYPUB)' },
+      { epoch: 1, member_user_id: 'u-b', sealed_team_key: 'S(K1->PUB-B)' },
+    ];
+
+    const fresh = mkCur({ members: membersOf([me, bob]), pubkeys: pubsOf([me, bob]) });
+    const have = mkCur({ members: membersOf([me, bob]), pubkeys: pubsOf([me, bob]), rows: bothRows });
+    const rotate = mkCur({ members: membersOf([me, bob]), pubkeys: pubsOf([me, bob]),
+      rows: bothRows.concat([{ epoch: 1, member_user_id: 'u-gone', sealed_team_key: 'S(K1->PUB-GONE)' }]) });
+    const joinCase = mkCur({ members: membersOf([me, bob]), pubkeys: pubsOf([me, bob]), rows: [bothRows[0]] });
+    const tofu = mkCur({ members: membersOf([me, bob]),
+      pubkeys: [pubsOf([me])[0], { user_id: 'u-b', public_key: 'EVIL' }],
+      pins: { 'u-b': { publicKey: 'PUB-B', name: 'Bob', firstSeen: 't0' } } });
+    const race = mkCur({ members: membersOf([me, bob]), pubkeys: pubsOf([me, bob]), dropInserts: true, raceWinnerKey: 'WINNER' });
+    const wait = mkCur({ members: membersOf([me, bob]), pubkeys: pubsOf([me, bob]),
+      rows: [{ epoch: 2, member_user_id: 'u-b', sealed_team_key: 'S(K2->PUB-B)' }] });
+    const cachedCur = mkCur({ members: membersOf([me, bob]), pubkeys: pubsOf([me, bob]), cache: new Map(), rows: bothRows });
+
+    let curErr = null, rFresh, rHave, rRotate, rJoin, rTofu, rRace, rWait, rCached1, rCached2;
+    try {
+      rFresh = await teamsync.resolveCurrentTeamKey(idc, fresh.deps);
+      rHave = await teamsync.resolveCurrentTeamKey(idc, have.deps);
+      rRotate = await teamsync.resolveCurrentTeamKey(idc, rotate.deps);
+      rJoin = await teamsync.resolveCurrentTeamKey(idc, joinCase.deps);
+      rTofu = await teamsync.resolveCurrentTeamKey(idc, tofu.deps);
+      rRace = await teamsync.resolveCurrentTeamKey(idc, race.deps);
+      rWait = await teamsync.resolveCurrentTeamKey(idc, wait.deps);
+      rCached1 = await teamsync.resolveCurrentTeamKey(idc, cachedCur.deps);
+      rCached2 = await teamsync.resolveCurrentTeamKey(idc, cachedCur.deps);
+    } catch (e) { curErr = e; }
+
+    check('teamsync: resolveCurrentTeamKey mints epoch 1 for a fresh team, sealed to every pinned member', () => {
+      assert.ok(!curErr, `resolveCurrentTeamKey threw: ${curErr && curErr.message}`);
+      assert.deepStrictEqual(rFresh, { teamKey: 'RAW1', epoch: 1 });
+      assert.strictEqual(fresh.calls.inserts.length, 1, 'one insert batch');
+      assert.deepStrictEqual(fresh.calls.inserts[0].map(r => r.member_user_id).sort(), ['me', 'u-b'], 'sealed to both members');
+      assert.ok(fresh.calls.inserts[0].every(r => r.epoch === 1), 'fresh team mints at epoch 1');
+      assert.strictEqual(fresh.pinsBox.pins['u-b'].publicKey, 'PUB-B', 'TOFU pinned the teammate key');
+    });
+
+    check('teamsync: resolveCurrentTeamKey with my sealed row unseals it — no mint, no insert', () => {
+      assert.ok(!curErr, `resolveCurrentTeamKey threw: ${curErr && curErr.message}`);
+      assert.deepStrictEqual(rHave, { teamKey: 'K1', epoch: 1 });
+      assert.strictEqual(have.calls.gen, 0, 'must not generate');
+      assert.strictEqual(have.calls.inserts.length, 0, 'must not insert');
+    });
+
+    check('teamsync: resolveCurrentTeamKey rotates to a new epoch when the current one is sealed to a removed member', () => {
+      assert.ok(!curErr, `resolveCurrentTeamKey threw: ${curErr && curErr.message}`);
+      assert.deepStrictEqual(rRotate, { teamKey: 'RAW1', epoch: 2 });
+      assert.strictEqual(rotate.calls.inserts.length, 1, 'one mint batch');
+      assert.ok(rotate.calls.inserts[0].every(r => r.epoch === 2), 'rotation mints the NEXT epoch');
+      assert.deepStrictEqual(rotate.calls.inserts[0].map(r => r.member_user_id).sort(), ['me', 'u-b'],
+        'the removed member gets no sealed row at the new epoch');
+    });
+
+    check('teamsync: resolveCurrentTeamKey join-seals the current key to members missing at the current epoch', () => {
+      assert.ok(!curErr, `resolveCurrentTeamKey threw: ${curErr && curErr.message}`);
+      assert.deepStrictEqual(rJoin, { teamKey: 'K1', epoch: 1 });
+      assert.strictEqual(joinCase.calls.gen, 0, 'join is a seal of the EXISTING key, not a rotation');
+      assert.strictEqual(joinCase.calls.inserts.length, 1, 'one join-seal insert');
+      assert.deepStrictEqual(joinCase.calls.inserts[0],
+        [{ team_id: 'team-cur', epoch: 1, member_user_id: 'u-b', sealed_team_key: 'S(K1->PUB-B)' }],
+        'the joiner gets the current key sealed to their pinned pubkey');
+    });
+
+    check('teamsync: resolveCurrentTeamKey excludes a member whose fetched key contradicts the pin, and alerts', () => {
+      assert.ok(!curErr, `resolveCurrentTeamKey threw: ${curErr && curErr.message}`);
+      assert.deepStrictEqual(rTofu, { teamKey: 'RAW1', epoch: 1 }, 'the mint itself proceeds for verified members');
+      assert.deepStrictEqual(tofu.calls.inserts[0].map(r => r.member_user_id), ['me'], 'mismatched member NOT sealed to');
+      assert.strictEqual(tofu.calls.alerts.length, 1, 'one alert');
+      assert.strictEqual(tofu.calls.alerts[0].user_id, 'u-b');
+      assert.strictEqual(tofu.calls.alerts[0].fetched, 'EVIL');
+      assert.strictEqual(tofu.pinsBox.pins['u-b'].publicKey, 'PUB-B', 'pin survives the attack');
+    });
+
+    check('teamsync: resolveCurrentTeamKey losing a mint race adopts the winner\'s key via read-back', () => {
+      assert.ok(!curErr, `resolveCurrentTeamKey threw: ${curErr && curErr.message}`);
+      assert.deepStrictEqual(rRace, { teamKey: 'WINNER', epoch: 1 },
+        'the key that COUNTS is whatever my read-back row unseals to, never my candidate');
+    });
+
+    check('teamsync: resolveCurrentTeamKey with an epoch I am not sealed into waits (null) — no mint, fail closed', () => {
+      assert.ok(!curErr, `resolveCurrentTeamKey threw: ${curErr && curErr.message}`);
+      assert.strictEqual(rWait, null, 'a teammate must join-seal me; minting would fork the team key');
+      assert.strictEqual(wait.calls.gen, 0, 'must not mint over an existing epoch');
+      assert.strictEqual(wait.calls.inserts.length, 0, 'must not insert');
+    });
+
+    check('teamsync: resolveCurrentTeamKey caches the resolution for the injected cache\'s lifetime', () => {
+      assert.ok(!curErr, `resolveCurrentTeamKey threw: ${curErr && curErr.message}`);
+      assert.deepStrictEqual(rCached1, { teamKey: 'K1', epoch: 1 });
+      assert.deepStrictEqual(rCached2, rCached1, 'second call returns the same resolution');
+      assert.strictEqual(cachedCur.calls.rowFetches, 1, 'second call must be served from cache');
     });
   }
 

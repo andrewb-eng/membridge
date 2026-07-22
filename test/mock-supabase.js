@@ -362,23 +362,38 @@ function createMockSupabase() {
         if (req.method === 'POST') {
           // Any member may seal rows for the team, including rows addressed
           // to teammates (009: insert policy checks the WRITER's membership).
+          // The (team_id, epoch, member_user_id) PK is enforced here: with
+          // Prefer resolution=ignore-duplicates conflicting rows are skipped
+          // (the concurrent-mint race), without it the insert 409s.
           const rows = Array.isArray(body) ? body : [body];
+          const ignoreDup = /ignore-duplicates/.test(req.headers.prefer || '');
           for (const r of rows) {
             if (!isMember(r.team_id, userId)) return json(res, 403, { message: 'row-level security violation' });
+            const dup = teamKeys.some(k => k.team_id === r.team_id &&
+              String(k.epoch) === String(r.epoch) && k.member_user_id === r.member_user_id);
+            if (dup) {
+              if (ignoreDup) continue;
+              return json(res, 409, { message: 'duplicate key value violates unique constraint "team_keys_pkey"' });
+            }
             teamKeys.push({ ...r });
           }
           res.writeHead(201);
           return res.end();
         }
-        // GET: only rows sealed TO the caller, and only while a member
-        // (009: select policy) — regardless of what filters were requested.
+        // GET (013 policy): every key row of a team the caller belongs to is
+        // visible — epoch membership is how any member detects rotation and
+        // join needs. Sealed blobs ride along; only the target's private key
+        // can open one, so visibility is not a confidentiality leak. The
+        // member_user_id filter is honored when the client sends it.
         const q = url.searchParams;
         const tEq = (q.get('team_id') || '').replace(/^eq\./, '');
         const eEq = (q.get('epoch') || '').replace(/^eq\./, '');
+        const mEq = (q.get('member_user_id') || '').replace(/^eq\./, '');
         const rows = teamKeys
-          .filter(k => k.member_user_id === userId && isMember(k.team_id, userId) &&
-            (!tEq || k.team_id === tEq) && (!eEq || String(k.epoch) === eEq))
-          .map(k => ({ sealed_team_key: k.sealed_team_key }));
+          .filter(k => isMember(k.team_id, userId) &&
+            (!tEq || k.team_id === tEq) && (!eEq || String(k.epoch) === eEq) &&
+            (!mEq || k.member_user_id === mEq))
+          .map(k => ({ epoch: k.epoch, member_user_id: k.member_user_id, sealed_team_key: k.sealed_team_key }));
         return json(res, 200, rows);
       }
       json(res, 404, { message: 'not found' });
