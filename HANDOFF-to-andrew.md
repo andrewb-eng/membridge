@@ -26,10 +26,19 @@ Tests: **586/586** — now includes a real DPAPI round-trip on `windows-latest` 
    - b. Land the license commit (rebased), reconcile the `package-lock` license line.
    - c. Publish npm at the merged version.
 
-## Migration numbers (your point 7)
+## Migration numbers (your point 7) — done, 016
 
-- **I did not add a migration.** My E2E recovery is entirely client-side (`teamsync.js` + `keychain.js`). So there's no `015_multidevice_keys.sql` from me — **feedback-hook keeps `015_feedback.sql` cleanly.**
-- **But there's a real gap that does need one:** self-heal deletes a member's *own* stale `team_keys` row so a holder can re-seal them. `team_keys` currently has SELECT + INSERT policies but **no DELETE policy** — so on the live backend the self-heal DELETE fails (degrades safely: delete fails → stays paused → fall back to rekey). To make self-heal work end-to-end we need a `team_keys` DELETE policy (member deletes only their own rows). **I'll author that as `016_multidevice_keys.sql`** — grabbing 016 per your note. Owner rekey needs no migration (insert-only — verified live).
+- Feedback-hook keeps `015_feedback.sql` cleanly (I didn't touch 015).
+- **I wrote `016_multidevice_keys.sql`** — a `team_keys` DELETE policy scoped hard to `member_user_id = auth.uid()` (a member can delete only their *own* rows — no way to drop a teammate's row, so no DoS). **It needs applying to Supabase** for full multi-device recovery to work on the live backend; until then self-heal degrades safely (delete fails → fall back to `rekey`). Owner rekey needs no migration (insert-only — verified live).
+
+## Multi-device recovery is now a real platform feature (not a marco/andrew patch)
+
+Implemented `reconcileTeamKeys` (runs once per team per sync pass) so **any** user on **any** new device recovers their **full** encrypted history automatically and securely:
+- **Self-heal:** a device whose keypair rotated drops its *own* unopenable rows across *all* epochs (RLS-confined to self).
+- **Re-seal:** a key-holder re-seals *every* epoch they can open to trusted members missing a row — not just the current epoch. A changed key stays withheld until `team trust`.
+- Converges in ≤2 passes; 587/587 incl. a test proving a new device recovers epoch 1 **and** 2.
+
+**To recover my 102 epoch-1 Mac entries on Windows:** apply `016` → I sync (drops my stale epoch-1 row) → you sync (re-seals epoch-1 to my new key; you may get a KEY CHANGE alert for me first, verify + `team trust marco`) → I decrypt. Same flow recovers anyone switching machines.
 
 ## Verified live, not just tests
 

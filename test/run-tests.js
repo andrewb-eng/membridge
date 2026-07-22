@@ -9613,10 +9613,8 @@ async function main() {
       await teamsync.signup(util.getConfig(), 'b-rec@test.dev', 'pw', 'Bob');
       await teamsync.joinTeam(util.getConfig(), teamR.invite_code);
       bobUserId = mockR.users.get('b-rec@test.dev').id;
-      // Bob's home must carry the linked project in state so syncTeams
-      // actually processes it (the team.json link is shared via the project
-      // dir; the state entry is what the sync loop iterates).
-      { const st = util.loadState(); st.projects[projR] = { events: [] }; util.saveState(st); }
+      // Bob bootstraps his identity first WITHOUT a linked project (uploads his
+      // pubkey, does not mint), so Alice's epoch-1 mint seals to BOTH members.
       await teamsync.syncTeams({ cryptoDeps: { keychain: kcBold, teamcrypto: tcR } });
 
       // Alice mints epoch-1 sealed to both (she pushes a session).
@@ -9630,10 +9628,11 @@ async function main() {
       util.saveState(stA);
       await teamsync.syncTeams({ project: projR, cryptoDeps: { keychain: kcA, teamcrypto: tcR } });
 
-      // Bob switches to a NEW device: fresh keychain, same home/creds. His
-      // sync uploads a new pubkey (overwriting the old) and must self-heal the
-      // now-unopenable epoch-1 row.
+      // Bob switches to a NEW device: fresh keychain, same home/creds. Give
+      // his home the project, then sync — uploads a new pubkey (overwriting the
+      // old) and must self-heal the now-unopenable epoch-1 row.
       process.env.MEMBRIDGE_HOME = homeB;
+      { const st = util.loadState(); st.projects[projR] = { events: [] }; util.saveState(st); }
       await teamsync.syncTeams({ project: projR, cryptoDeps: { keychain: kcBnew, teamcrypto: tcR } });
       bobStaleDropped = !mockR.teamKeys.some(k => k.member_user_id === bobUserId);
 
@@ -9687,6 +9686,84 @@ async function main() {
       assert.ok(!err, `recovery scenario threw: ${err && err.message}`);
       assert.ok(nonOwnerRekey && nonOwnerRekey.ok === false, 'non-owner rekey must fail');
       assert.ok(/owner or admin/i.test(nonOwnerRekey.error || ''), `expected role error, got: ${nonOwnerRekey && nonOwnerRekey.error}`);
+    });
+  }
+
+  // Multi-device FULL-HISTORY recovery: a new device must recover EVERY past
+  // epoch it's entitled to, not just the current one — the platform behavior
+  // that makes "log in on a new machine, see all your history" actually work.
+  {
+    const tcM = require('../lib/teamcrypto');
+    const mkKc = () => { const m = new Map(); return {
+      available: () => true, load: a => m.get(a) || null,
+      store: (a, s) => { m.set(a, s); return true; }, remove: a => m.delete(a) }; };
+    const setCfg = () => { util.ensureConfig(); const raw = util.loadUserConfig();
+      raw.team = { ...(raw.team || {}), sharePrompts: true, encrypt: true }; util.saveUserConfig(raw); };
+    const sHome = process.env.MEMBRIDGE_HOME, sUrl = process.env.MEMBRIDGE_TEAM_URL, sKey = process.env.MEMBRIDGE_TEAM_ANON_KEY;
+    const hA = path.join(ROOT, 'home-mdA'), hB = path.join(ROOT, 'home-mdB');
+    const projM = path.join(ROOT, 'projects', 'md-app');
+    fs.mkdirSync(projM, { recursive: true });
+    const kcA = mkKc(), kcBold = mkKc(), kcBnew = mkKc();
+    const mockM = createMockSupabase();
+    let err = null, bobUserId = null, openEpochs = null, teamId = null;
+    try {
+      await new Promise(r => mockM.server.listen(17974, '127.0.0.1', r));
+      process.env.MEMBRIDGE_TEAM_URL = 'http://127.0.0.1:17974';
+      process.env.MEMBRIDGE_TEAM_ANON_KEY = 'anon-test';
+
+      process.env.MEMBRIDGE_HOME = hA; setCfg();
+      await teamsync.signup(util.getConfig(), 'a-md@test.dev', 'pw', 'Alice');
+      const t = await teamsync.createTeam(util.getConfig(), 'MD'); teamId = t.team_id;
+      await teamsync.linkProject(util.getConfig(), projM, t.team_id, 'MD');
+
+      process.env.MEMBRIDGE_HOME = hB; setCfg();
+      await teamsync.signup(util.getConfig(), 'b-md@test.dev', 'pw', 'Bob');
+      await teamsync.joinTeam(util.getConfig(), t.invite_code);
+      bobUserId = mockM.users.get('b-md@test.dev').id;
+      // Bob bootstraps his identity WITHOUT a linked project, so he only
+      // uploads his pubkey and does NOT mint — Alice's epoch-1 mint then seals
+      // to BOTH members (mirrors the real join-before-first-content order).
+      await teamsync.syncTeams({ cryptoDeps: { keychain: kcBold, teamcrypto: tcM } });
+
+      // Alice mints epoch-1 (push), then rekeys to epoch-2 — both sealed to
+      // Bob's ORIGINAL key. Now there is real multi-epoch history.
+      process.env.MEMBRIDGE_HOME = hA;
+      const stA = util.loadState();
+      stA.projects[projM] = { events: [
+        { ts: '2026-07-18T12:00:00.000Z', source: 'Claude Code', kind: 'prompt', text: 'epoch one work', session: 'm1' },
+        { ts: '2026-07-18T12:01:00.000Z', source: 'Claude Code', kind: 'edit', file: path.join(projM, 'a.js'), session: 'm1' },
+      ] };
+      util.saveState(stA);
+      await teamsync.syncTeams({ project: projM, cryptoDeps: { keychain: kcA, teamcrypto: tcM } });
+      await teamsync.rekeyTeam(util.getConfig(), t.team_id, { cryptoDeps: { keychain: kcA, teamcrypto: tcM } });
+
+      // Bob's NEW device: give his home the project now, both his epoch-1 and
+      // epoch-2 rows are stale against his fresh keypair.
+      process.env.MEMBRIDGE_HOME = hB;
+      { const st = util.loadState(); st.projects[projM] = { events: [] }; util.saveState(st); }
+      await teamsync.syncTeams({ project: projM, cryptoDeps: { keychain: kcBnew, teamcrypto: tcM } });
+
+      // Alice re-trusts Bob's new key and syncs: reconcile re-seals BOTH epochs.
+      process.env.MEMBRIDGE_HOME = hA;
+      await teamsync.trustMember(util.getConfig(), bobUserId);
+      await teamsync.syncTeams({ project: projM, cryptoDeps: { keychain: kcA, teamcrypto: tcM } });
+
+      // Prove Bob's NEW key can open every epoch sealed to him.
+      await tcM.ready();
+      const priv = kcBnew.load('membridge.box.privatekey'), pub = kcBnew.load('membridge.box.publickey');
+      const bobRows = mockM.teamKeys.filter(k => k.member_user_id === bobUserId);
+      openEpochs = bobRows
+        .filter(k => tcM.unsealTeamKey(k.sealed_team_key, pub, priv))
+        .map(k => Number(k.epoch)).sort();
+    } catch (e) { err = e; } finally {
+      process.env.MEMBRIDGE_HOME = sHome; process.env.MEMBRIDGE_TEAM_URL = sUrl; process.env.MEMBRIDGE_TEAM_ANON_KEY = sKey;
+      mockM.server.close();
+    }
+
+    check('teamsync: a new device recovers ALL past epochs (full history), not just the current one', () => {
+      assert.ok(!err, `multi-epoch scenario threw: ${err && err.message}`);
+      assert.deepStrictEqual(openEpochs, [1, 2],
+        `Bob's new device must open epoch 1 AND 2 after recovery, opened: ${JSON.stringify(openEpochs)}`);
     });
   }
 
