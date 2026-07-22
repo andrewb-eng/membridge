@@ -384,4 +384,4 @@ Next up, in rough order:
 
 ## License
 
-MIT
+Source-available under the Functional Source License (FSL-1.1-ALv2); converts to Apache-2.0 two years after each release.
