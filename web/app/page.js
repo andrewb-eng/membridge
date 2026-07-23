@@ -24,7 +24,7 @@ export default function Landing() {
           Open your workspace
         </Link>
         <a
-          href="https://github.com/mmelika/membridge#readme"
+          href="https://github.com/MembridgeAi/membridge#readme"
           className="rounded-xl border border-slate-200 bg-white px-5 py-3 text-sm font-semibold hover:border-blue-300"
         >
           Install the CLI

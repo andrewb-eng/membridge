@@ -158,7 +158,7 @@ set -eu
 
 VERSION="__MEMBRIDGE_VERSION__"
 SHA256="__MEMBRIDGE_SHA256__"
-REPO="mmelika/membridge"
+REPO="MembridgeAi/membridge"
 APP_NAME="MemBridge"
 APP_DEST="/Applications/${APP_NAME}.app"
 CLI_DEST="/usr/local/bin/membridge"
@@ -441,7 +441,7 @@ release regenerates and republishes `install.sh`.
    `scripts/install/install.sh` to the root of the `mmelika/membridge-site`
    repo as `install.sh`, commit, and push (GitHub Pages serves it). The raw
    fallback URL, which works without the site repo, is
-   `https://raw.githubusercontent.com/mmelika/membridge/master/scripts/install/install.sh`.
+   `https://raw.githubusercontent.com/MembridgeAi/membridge/master/scripts/install/install.sh`.
 6. Commit the regenerated `scripts/install/install.sh` in this repo.
 7. Smoke-test on a clean Apple Silicon machine:
    ```sh

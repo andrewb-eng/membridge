@@ -14,9 +14,9 @@
   ],
   "license": "FSL-1.1-ALv2",
   "author": "Andrew Brown & Marco Melika",
-  "homepage": "https://github.com/mmelika/membridge#readme",
+  "homepage": "https://github.com/MembridgeAi/membridge#readme",
   "bugs": {
-    "url": "https://github.com/mmelika/membridge/issues"
+    "url": "https://github.com/MembridgeAi/membridge/issues"
   },
   "bin": {
     "membridge": "bin/membridge.js"
@@ -69,7 +69,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/mmelika/membridge.git"
+    "url": "git+https://github.com/MembridgeAi/membridge.git"
   },
   "devDependencies": {
     "electron": "^43.1.0",

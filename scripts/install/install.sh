@@ -7,7 +7,7 @@ set -eu
 
 VERSION="0.1.1"
 SHA256="85952ea1f5057efa09aa61f53bad1a485cd9d0b4685e1c2a023db19d830e2cea"
-REPO="mmelika/membridge"
+REPO="MembridgeAi/membridge"
 APP_NAME="MemBridge"
 APP_DEST="/Applications/${APP_NAME}.app"
 CLI_DEST="/usr/local/bin/membridge"

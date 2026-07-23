@@ -9798,7 +9798,7 @@ async function main() {
         const first = printed();
         assert.ok(/MemBridge is running/.test(first), 'message A not printed');
         assert.ok(/membridge\.me\/feedback\?ref=cli/.test(first), 'message A missing the feedback link');
-        assert.ok(/mmelika\/membridge/.test(first) && !/andrewb-eng/.test(first), 'links must use mmelika/membridge only');
+        assert.ok(/MembridgeAi\/membridge/.test(first) && !/andrewb-eng/.test(first), 'links must use MembridgeAi/membridge only');
         cap(); prompts.maybeFirstRun(util.getConfig()); uncap();
         assert.strictEqual(printed(), '', 'message A must not print a second time');
         assert.strictEqual(util.loadState().feedback.firstRunShown, true, 'firstRunShown not persisted');

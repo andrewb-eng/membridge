@@ -809,7 +809,7 @@ Team sync (share project memory with your team — see README):
   team setup ...           advanced: point at your own self-hosted backend
 
 Config: ${util.configPath()}
-Docs:   https://github.com/mmelika/membridge#readme`);
+Docs:   https://github.com/MembridgeAi/membridge#readme`);
 }
 
 const commands = {
