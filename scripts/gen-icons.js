@@ -5,27 +5,29 @@ const fs = require('fs');
 const path = require('path');
 const zlib = require('zlib');
 
-// 16x16 MemBridge "M-bridge" mark (matches the vendored brand mark at
-// app/assets/brand/membridge-mark-*.svg — an M whose strokes stand as
-// bridge towers over the crossbar deck).
-const GLYPH = [
-  '................',
-  '..#..........#..',
-  '..##........##..',
-  '..#.#......#.#..',
-  '..#..#....#..#..',
-  '..#...#..#...#..',
-  '..#....##....#..',
-  '..#....##....#..',
-  '..#..........#..',
-  '..#..........#..',
-  '.##############.',
-  '..#..........#..',
-  '..#..........#..',
-  '..#..........#..',
-  '................',
-  '................',
+// MemBridge "M-bridge" mark, same stroke geometry as the vendored brand
+// SVGs (app/assets/brand/membridge-mark-*.svg, viewBox 0 0 32): an M whose
+// towers carry a wider crossbar deck, with the V dipping just below it.
+// Rendered here as round-capped strokes so the tray icon matches the logo
+// exactly at any size.
+const SEGS = [
+  [9, 11, 9, 22.5],   // left tower
+  [9, 11, 16, 18],    // left diagonal
+  [16, 18, 23, 11],   // right diagonal
+  [23, 11, 23, 22.5], // right tower
+  [5, 16.5, 27, 16.5], // bridge deck
 ];
+const STROKE = 3;
+const HALF = STROKE / 2;
+// mark bounds including the round caps
+const BX0 = 5 - HALF, BX1 = 27 + HALF;
+const BY0 = 11 - HALF, BY1 = 22.5 + HALF;
+
+function distToSeg(px, py, [x0, y0, x1, y1]) {
+  const dx = x1 - x0, dy = y1 - y0;
+  const t = Math.max(0, Math.min(1, ((px - x0) * dx + (py - y0) * dy) / (dx * dx + dy * dy)));
+  return Math.hypot(px - (x0 + t * dx), py - (y0 + t * dy));
+}
 
 let CRC_TABLE;
 function crc32(buf) {
@@ -72,15 +74,29 @@ function png(w, h, rgba) {
 
 function render(scale, [r, g, b]) {
   const size = 16 * scale;
+  const margin = scale; // 1px of breathing room per 16px of icon
+  const fit = (size - 2 * margin) / (BX1 - BX0);
+  const ox = margin, oy = (size - (BY1 - BY0) * fit) / 2;
+  const SS = 4; // 4x4 subsamples per pixel for antialiasing
   const rgba = Buffer.alloc(size * size * 4);
   for (let y = 0; y < size; y++) {
     for (let x = 0; x < size; x++) {
-      if (GLYPH[Math.floor(y / scale)][Math.floor(x / scale)] === '#') {
+      let hit = 0;
+      for (let sy = 0; sy < SS; sy++) {
+        for (let sx = 0; sx < SS; sx++) {
+          const mx = BX0 + (x + (sx + 0.5) / SS - ox) / fit;
+          const my = BY0 + (y + (sy + 0.5) / SS - oy) / fit;
+          for (const s of SEGS) {
+            if (distToSeg(mx, my, s) <= HALF) { hit++; break; }
+          }
+        }
+      }
+      if (hit) {
         const i = (y * size + x) * 4;
         rgba[i] = r;
         rgba[i + 1] = g;
         rgba[i + 2] = b;
-        rgba[i + 3] = 255;
+        rgba[i + 3] = Math.round((255 * hit) / (SS * SS));
       }
     }
   }
