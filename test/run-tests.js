@@ -5049,6 +5049,139 @@ async function main() {
     }
   }
 
+  // Wire parity: a teammate must see the same quality as the author's local
+  // view. Three gaps closed here: (1) the pushed summary was clipped to 300
+  // chars and the headline never left the machine, so teammate cards rendered
+  // a derived, truncated title over a cut-off body; (2) a distilled brief that
+  // lands AFTER an entry's first push (the normal case — pushes run every 60s,
+  // briefs at session Stop) was never re-sent, because the cursor skips
+  // already-pushed ts and ignore-duplicates never overwrites; (3) the pull
+  // cursor + seen-key skip meant even a re-pushed row never replaced the stale
+  // copy in teamEntries.
+  check('parity: entryToRow ships the full summary (summaryFull), not the 300-char clip', () => {
+    const rx = digest.compileRedactions(util.getConfig());
+    const cr = { userId: 'u1', displayName: 'Parity' };
+    const full = 'Sentence one of the full brief. '.repeat(20) + 'Tail sentinel api_key=parityfullsecret9999 end.';
+    const e = {
+      ts: 't1', source: 'Claude Code', session: 'sP', files: [],
+      summary: full.slice(0, 299) + '…', summaryFull: full, distilled: true,
+    };
+    const row = teamsync.entryToRow(e, 'p1', cr, false, rx);
+    assert.ok(row.summary && row.summary.length > 300, `summary still clipped: len=${(row.summary || '').length}`);
+    assert.ok(row.summary.includes('Tail sentinel'), 'the tail of the full summary was lost');
+    assert.ok(row.summary.includes('[redacted'), 'full summary skipped redaction');
+    assert.ok(!row.summary.includes('parityfullsecret9999'), 'secret leaked in the full summary');
+  });
+  check('parity: entryToRow carries headline (null when absent, key always present)', () => {
+    const rx = digest.compileRedactions(util.getConfig());
+    const cr = { userId: 'u1', displayName: 'Parity' };
+    const withH = teamsync.entryToRow({ ts: 't1', source: 'Claude Code', session: 'sP', files: [], summary: 's', headline: 'Shipped the thing end to end' }, 'p1', cr, false, rx);
+    const without = teamsync.entryToRow({ ts: 't2', source: 'Claude Code', session: 'sP', files: [], summary: 's' }, 'p1', cr, false, rx);
+    assert.strictEqual(withH.headline, 'Shipped the thing end to end');
+    assert.ok('headline' in without, 'headline key dropped from a headline-less row (mixed-shape batch)');
+    assert.strictEqual(without.headline, null);
+  });
+  await check('parity: encryptRow seals headline in the ciphertext and nulls it under plaintextOff', async () => {
+    const tc = require('../lib/teamcrypto');
+    if (!tc.available()) return; // libsodium unavailable in this env — skip as pass
+    await tc.ready();
+    const teamKey = tc.genTeamKey();
+    const row = { ts: 't1', source: 'Claude Code', ask: null, goal: null, decisions: null, gotchas: null, files: [], changes: null, summary: 'the brief', headline: 'The headline', distilled: true };
+    const out = teamsync.encryptRow(row, teamKey, 1, { teamcrypto: tc, plaintextOff: true });
+    assert.strictEqual(out.headline, null, 'plaintextOff left the headline readable next to the ciphertext');
+    const payload = tc.decrypt(out.ciphertext, out.nonce, teamKey);
+    assert.strictEqual(payload.headline, 'The headline', 'headline missing from the encrypted payload');
+  });
+
+  // The end-to-end ratchet: entry pushes before its brief exists; the brief
+  // must still reach the backend (merge re-push with a bumped created_at so
+  // every pull cursor re-sees the row), and an unchanged entry must NOT be
+  // re-pushed on the next cycle.
+  {
+    const mockWP = createMockSupabase();
+    await new Promise(r => mockWP.server.listen(17959, '127.0.0.1', r));
+    process.env.MEMBRIDGE_TEAM_URL = 'http://127.0.0.1:17959';
+    process.env.MEMBRIDGE_TEAM_ANON_KEY = 'anon-test';
+    try {
+      const projWP = path.join(ROOT, 'projects', 'wire-parity-app');
+      fs.mkdirSync(projWP, { recursive: true });
+      await teamsync.signup(util.getConfig(), 'parity@test.dev', 'pw-wp', 'Parity');
+      const teamWP = await teamsync.createTeam(util.getConfig(), 'ParityTeam');
+      await teamsync.linkProject(util.getConfig(), projWP, teamWP.team_id, 'ParityTeam');
+      const wpAgo = sec => new Date(Date.now() - sec * 1000).toISOString();
+      const LONG = 'Sentence one of the full brief. '.repeat(20) + 'Late tail sentinel api_key=latebriefsecret1234 end.';
+      const st = util.loadState();
+      st.projects[projWP] = { events: [
+        { ts: wpAgo(120), source: 'Claude Code', kind: 'prompt', session: 'sW', text: 'build the thing' },
+      ] };
+      util.saveState(st);
+      await teamsync.syncTeams({ project: projWP }); // first push: brief doesn't exist yet
+      const first = mockWP.entries.filter(e => e.session === 'sW')[0];
+      check('parity precondition: the first push predates the brief (no summary on the row)', () => {
+        assert.ok(first, 'entry was not pushed at all');
+        assert.ok(!first.summary, `expected a summaryless first push, got: ${first.summary}`);
+      });
+      const firstCreatedAt = first && first.created_at;
+      // Session Stop lands the distilled brief; it attaches to the SAME entry
+      // ts, which the push cursor has already passed.
+      const st2 = util.loadState();
+      st2.projects[projWP].events.push({
+        ts: wpAgo(10), source: 'Distilled', kind: 'summary', session: 'sW',
+        text: LONG, headline: 'Shipped the thing end to end', goal: 'ship it',
+        decisions: '', gotchas: '', highlights: [],
+      });
+      util.saveState(st2);
+      await teamsync.syncTeams({ project: projWP });
+      check('parity: a brief that lands after first push is re-pushed with full text + headline', () => {
+        const row = mockWP.entries.filter(e => e.session === 'sW')[0];
+        assert.ok(row.summary, 'the late brief never reached the backend (first-push-wins ratchet)');
+        assert.ok(row.summary.length > 300 && row.summary.includes('Late tail sentinel'), `summary clipped or stale: len=${row.summary.length}`);
+        assert.ok(!row.summary.includes('latebriefsecret1234'), 'secret leaked in the re-pushed summary');
+        assert.strictEqual(row.headline, 'Shipped the thing end to end', 'headline missing from the re-pushed row');
+        assert.ok(row.created_at && firstCreatedAt && row.created_at > firstCreatedAt,
+          `created_at not bumped (pull cursors would never re-see the row): ${firstCreatedAt} -> ${row.created_at}`);
+      });
+      const secondCreatedAt = (mockWP.entries.filter(e => e.session === 'sW')[0] || {}).created_at;
+      await teamsync.syncTeams({ project: projWP });
+      check('parity: an unchanged entry is not re-pushed every cycle', () => {
+        const row = mockWP.entries.filter(e => e.session === 'sW')[0];
+        assert.strictEqual(row.created_at, secondCreatedAt, 'row was re-pushed with no content change');
+      });
+      // Pull side: a re-pushed row (same author|ts|source key, newer
+      // created_at) must REPLACE the stale copy in teamEntries, not be
+      // skipped by the seen-key dedup.
+      await check('parity: pullProject replaces a stale teamEntries copy with the re-pushed version', async () => {
+        const creds = await teamsync.getAccessToken(util.getConfig());
+        const link = teamsync.loadTeamLink(projWP);
+        const proj = { teamEntries: [], teamPullTs: undefined };
+        mockWP.entries.push({
+          project_id: link.projectId, author_id: 'user-other', author_name: 'Other',
+          ts: wpAgo(60), source: 'Claude Code', session: 'sO', ask: null,
+          summary: 'v1 early harvested line', distilled: false, files: [], changes: null,
+          goal: null, decisions: null, gotchas: null, headline: null,
+          id: 9001, created_at: new Date(Date.now() + 1000).toISOString(),
+        });
+        await teamsync.pullProject(util.getConfig(), creds, proj, link, null);
+        assert.strictEqual((proj.teamEntries[0] || {}).summary, 'v1 early harvested line', 'precondition: v1 pulled');
+        const idx = mockWP.entries.findIndex(e => e.session === 'sO');
+        mockWP.entries[idx] = {
+          ...mockWP.entries[idx],
+          summary: 'v2 the real distilled brief, much better', distilled: true,
+          headline: 'The real headline', created_at: new Date(Date.now() + 2000).toISOString(),
+        };
+        await teamsync.pullProject(util.getConfig(), creds, proj, link, null);
+        const got = proj.teamEntries.filter(e => e.session === 'sO');
+        assert.strictEqual(got.length, 1, `re-pushed row duplicated instead of replacing (${got.length} copies)`);
+        assert.strictEqual(got[0].summary, 'v2 the real distilled brief, much better', 'stale v1 survived the pull (seen-key skip)');
+        assert.strictEqual(got[0].headline, 'The real headline', 'headline not mapped on pull');
+      });
+    } finally {
+      delete process.env.MEMBRIDGE_TEAM_URL;
+      delete process.env.MEMBRIDGE_TEAM_ANON_KEY;
+      await new Promise(r => mockWP.server.close(r));
+    }
+  }
+
   // Task 6 (per-session prompt sharing): POST /api/share-session persists the
   // per-session flag into proj.sharedSessions (authoritative for future
   // normal pushes) and calls teamsync.reshareSession to retroactively
