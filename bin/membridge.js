@@ -19,6 +19,7 @@ const { startServer } = require('../lib/server');
 const autostart = require('../lib/autostart');
 const teamsync = require('../lib/teamsync');
 const hooks = require('../lib/hooks');
+const prompts = require('../lib/prompts');
 const pkg = require('../package.json');
 
 const args = process.argv.slice(2);
@@ -58,6 +59,7 @@ function cmdSync() {
   const result = syncOnce({ dryRun, project: opt('--project') });
   console.log(`${dryRun ? '[dry run] ' : ''}${result.newEvents} new event(s), ${result.projects.length} project(s) affected`);
   printChanges(result);
+  prompts.flushValueMoment(util.getConfig());
   if (!dryRun && teamsync.isConfigured(util.getConfig())) {
     return teamSyncPass({ project: opt('--project') }).catch(err => console.error(`team sync failed: ${err.message}`));
   }
@@ -106,6 +108,11 @@ function cmdDaemon() {
   fs.mkdirSync(util.homeDir(), { recursive: true });
   fs.writeFileSync(util.pidPath(), String(process.pid));
   util.log(`daemon started (pid ${process.pid}, interval ${config.intervalSec}s, v${pkg.version})`);
+
+  // Auto-register the Claude Code Stop hook on every daemon boot, so it lands
+  // however MemBridge was installed (git clone, npm, curl) without a manual
+  // `setup-hooks` step. Silent and fail-open — never blocks the daemon.
+  hooks.ensureInstalled();
 
   const cleanup = () => {
     try {
@@ -184,6 +191,10 @@ function cmdStart() {
   const config = util.getConfig();
   console.log(`MemBridge daemon started in the background (pid ${child.pid}).`);
   console.log(`Dashboard: http://127.0.0.1:${config.dashboardPort}`);
+  // First-run + any due value-moment nudge, on the interactive foreground
+  // command (never in the detached daemon's logfile — see lib/prompts.js).
+  prompts.maybeFirstRun(config);
+  prompts.flushValueMoment(config);
 }
 
 function cmdStop() {
@@ -224,6 +235,7 @@ function cmdStatus() {
     const paused = util.isProjectOff(key, config) ? ' [paused]' : '';
     console.log(`  ${key}${paused} — ${proj.events.length} event(s), last sync ${proj.lastSync || 'never'}`);
   }
+  prompts.flushValueMoment(config);
 }
 
 function cmdRemove() {
@@ -253,6 +265,30 @@ function cmdRemove() {
   console.log(n ? `Done — ${n} file(s) cleaned.` : 'No MemBridge blocks found.');
 }
 
+// `membridge config <get|set> <key> [value]`. Minimal + generic, but only the
+// `prompts` key is wired today: it toggles the local feedback nudges (no
+// telemetry either way — the messages are the only thing being suppressed).
+function cmdConfig(sub, key, val) {
+  if (sub === 'get' && key === 'prompts') {
+    // Effective value: default on unless explicitly disabled.
+    console.log(`prompts ${util.getConfig().prompts === false ? 'off' : 'on'}`);
+    return;
+  }
+  if (sub === 'set' && key === 'prompts') {
+    if (val !== 'on' && val !== 'off') {
+      console.error('Usage: membridge config set prompts <on|off>');
+      process.exit(1);
+    }
+    const raw = util.loadUserConfig();
+    raw.prompts = (val === 'on');
+    util.saveUserConfig(raw);
+    console.log(`prompts ${val === 'on' ? 'on' : 'off'}`);
+    return;
+  }
+  console.error('Usage:\n  membridge config get prompts\n  membridge config set prompts <on|off>');
+  process.exit(1);
+}
+
 function openBrowser(url) {
   if (process.platform === 'win32') spawnSync('cmd', ['/c', 'start', '', url], { stdio: 'ignore' });
   else if (process.platform === 'darwin') spawnSync('open', [url], { stdio: 'ignore' });
@@ -270,6 +306,7 @@ function cmdDashboard() {
     openBrowser(url);
   }
   console.log(`Dashboard: ${url}`);
+  prompts.flushValueMoment(config);
 }
 
 // lib/mcp.js (and its @modelcontextprotocol/sdk + zod dependencies) is
@@ -277,6 +314,45 @@ function cmdDashboard() {
 // dependency-light main path — `membridge status` etc. never load the SDK.
 async function cmdMcp() {
   await require('../lib/mcp').startMcpServer();
+}
+
+// `membridge update` — check GitHub for a newer release and update in place.
+// `--check` only reports (never runs anything). For npm installs we run the
+// upgrade inline; for the macOS app we PRINT the one-liner instead of running
+// it, because the installer quits and replaces the very app whose runtime is
+// executing this command — that must happen in the user's own terminal.
+async function cmdUpdate() {
+  const updateCheck = require('../lib/update-check');
+  console.log('Checking for updates…');
+  const r = await updateCheck.check({ force: true });
+  if (!r.latest) {
+    console.log(`Couldn't reach the update server (offline or rate-limited). You're on v${r.current}.`);
+    return;
+  }
+  if (!r.updateAvailable) {
+    console.log(`You're on the latest version (v${r.current}).`);
+    return;
+  }
+  const kind = updateCheck.installKind();
+  const command = updateCheck.updateCommand(kind);
+  console.log(`Update available: v${r.current} → v${r.latest}\n`);
+  if (flag('--check')) {
+    console.log(`Update with:\n  ${command}`);
+    return;
+  }
+  if (kind === 'app') {
+    // Auto-running the installer here would pkill this process mid-run.
+    console.log('This is the macOS app. Run this in your terminal to update');
+    console.log('(it quits MemBridge, swaps the app, and relaunches):\n');
+    console.log(`  ${command}\n`);
+    return;
+  }
+  console.log(`Updating via: ${command}\n`);
+  const res = spawnSync('npm', ['install', '-g', 'membridge'], { stdio: 'inherit' });
+  if (res.status !== 0) {
+    die(`Update failed (exit ${res.status}). Run it manually:\n  ${command}`);
+  }
+  console.log(`\nUpdated to v${r.latest}. Restart the daemon if it was running: membridge start`);
 }
 
 // File-level provenance: which AI sessions (yours and teammates') edited a
@@ -532,6 +608,30 @@ async function cmdTeam() {
     return;
   }
 
+  // Owner/admin recovery: mint a fresh team key sealed to every trusted
+  // member's CURRENT key. Use when this device can't get the existing key
+  // (e.g. a new machine whose keypair rotated) and can't wait for a teammate
+  // to re-share. Forward-only — encrypted history from before the rekey stays
+  // readable only by whoever already holds those older keys.
+  if (sub === 'rekey') {
+    let teamId = opt('--team') || args[2];
+    const teams = await teamsync.listTeams(config);
+    if (!teams.length) die('You are not in any team yet.');
+    if (!teamId && teams.length === 1) teamId = teams[0].team_id;
+    if (!teamId) {
+      die('You are in multiple teams — pick one with --team <id>:\n' +
+        teams.map(t => `  ${t.team_id}  ${t.team_name || ''}`).join('\n'));
+    }
+    const r = await teamsync.rekeyTeam(config, teamId);
+    if (!r.ok) die(r.error);
+    console.log(`Team rekeyed — new epoch ${r.epoch}, sealed to ${r.sealed} member(s). Encryption is active on this device now.`);
+    if (r.withheld && r.withheld.length) {
+      console.log(`  Withheld from (unpublished or unverified key): ${r.withheld.join(', ')}`);
+      console.log('  They rejoin encryption once their key is trusted (`membridge team trust <name>`) and they sync.');
+    }
+    return;
+  }
+
   if (sub === 'create') {
     const name = args[2];
     if (!name) die('Usage: membridge team create <name>');
@@ -662,6 +762,10 @@ Usage: membridge <command>
   remove [--project <path>]             strip injected memory blocks
   enable-autostart    launch MemBridge automatically at login
   disable-autostart   remove the login launcher
+  update [--check]    check for a newer release and update in place
+                      (--check only reports; never runs anything)
+  config get prompts            show whether feedback nudges are on
+  config set prompts <on|off>   turn the local feedback nudges on or off
   daemon              run in the foreground (used internally / by services)
   help                this text
 
@@ -705,7 +809,7 @@ Team sync (share project memory with your team — see README):
   team setup ...           advanced: point at your own self-hosted backend
 
 Config: ${util.configPath()}
-Docs:   https://github.com/mmelika/membridge#readme`);
+Docs:   https://github.com/MembridgeAi/membridge#readme`);
 }
 
 const commands = {
@@ -718,7 +822,9 @@ const commands = {
   stop: cmdStop,
   status: cmdStatus,
   remove: cmdRemove,
+  config: () => cmdConfig(args[1], args[2], args[3]),
   dashboard: cmdDashboard,
+  update: cmdUpdate,
   mcp: cmdMcp,
   signup: cmdSignup,
   login: cmdLogin,

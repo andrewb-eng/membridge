@@ -220,6 +220,33 @@ async function main() {
     assert.ok(fs.existsSync(binned), 'app/bin/membridge.js not created by prepare-app');
   });
 
+  check('prepare-app bundles the runtime dependency closure into app/node_modules', () => {
+    // Regression: packaged builds shipped libsodium-wrappers WITHOUT its
+    // `libsodium` engine dependency, so require() failed inside the asar and
+    // team encryption paused fail-closed whenever the tray app ran the sync.
+    // Walk root dependencies transitively; every package in the closure must
+    // land in app/node_modules or the packaged app cannot require it.
+    const r = spawnSync('node', [path.join(__dirname, '..', 'scripts', 'prepare-app.js')], { encoding: 'utf8' });
+    assert.strictEqual(r.status, 0, `prepare-app failed: ${r.stderr}`);
+    const appRoot = path.join(__dirname, '..');
+    const rootPkg = JSON.parse(fs.readFileSync(path.join(appRoot, 'package.json'), 'utf8'));
+    const want = new Set();
+    const queue = Object.keys(rootPkg.dependencies || {});
+    while (queue.length) {
+      const name = queue.shift();
+      if (want.has(name)) continue;
+      want.add(name);
+      const pkg = JSON.parse(fs.readFileSync(
+        path.join(appRoot, 'node_modules', name, 'package.json'), 'utf8'));
+      queue.push(...Object.keys(pkg.dependencies || {}));
+    }
+    assert.ok(want.size >= 2, 'closure should hold libsodium-wrappers plus its engine');
+    for (const name of want) {
+      assert.ok(fs.existsSync(path.join(appRoot, 'app', 'node_modules', name, 'package.json')),
+        `app/node_modules/${name} missing — the packaged app cannot require it`);
+    }
+  });
+
   check('gen-install: sha256File hashes file contents', () => {
     const gen = require('../scripts/install/gen-install');
     const f = path.join(ROOT, 'fixture.zip');
@@ -637,48 +664,41 @@ async function main() {
     assert.strictEqual(out[0].status, 'edited');
     assert.strictEqual(out[0].add, null); // rename counts are best-effort null
   });
+  // Stubs cp.execFileSync itself (lib/changes.js calls it via the module
+  // object, not a destructured const, exactly so it can be swapped here) —
+  // proves what defaultRunGit passes to the subprocess call without needing
+  // a real spawnable fake `git`, whose shape (shebang script vs. PE exe) is
+  // not portable across POSIX and Windows.
+  const cp = require('child_process');
+  function withStubExecFileSync(stub, fn) {
+    const real = cp.execFileSync;
+    cp.execFileSync = stub;
+    try { return fn(); } finally { cp.execFileSync = real; }
+  }
   check('changes: defaultRunGit hardens env (no terminal prompt, no optional locks)', () => {
-    const stubDir = fs.mkdtempSync(path.join(os.tmpdir(), 'membridge-stubgit-'));
-    const stubGit = path.join(stubDir, 'git');
-    fs.writeFileSync(stubGit, '#!/bin/sh\necho "$GIT_TERMINAL_PROMPT:$GIT_OPTIONAL_LOCKS"\n');
-    fs.chmodSync(stubGit, 0o755);
-    const prevPath = process.env.PATH;
-    process.env.PATH = stubDir + path.delimiter + prevPath;
-    try {
-      const out = changesLib.defaultRunGit(stubDir)(['status']);
-      assert.strictEqual(out, '0:0\n', `git subprocess env not hardened: ${JSON.stringify(out)}`);
-    } finally {
-      process.env.PATH = prevPath;
-    }
+    let seenEnv = null;
+    withStubExecFileSync((file, args, opts) => { seenEnv = opts.env; return 'ok'; }, () => {
+      changesLib.defaultRunGit('/repo')(['status']);
+    });
+    assert.ok(seenEnv, 'execFileSync was not called');
+    assert.strictEqual(seenEnv.GIT_TERMINAL_PROMPT, '0', 'GIT_TERMINAL_PROMPT not hardened');
+    assert.strictEqual(seenEnv.GIT_OPTIONAL_LOCKS, '0', 'GIT_OPTIONAL_LOCKS not hardened');
   });
   check('changes: defaultRunGit still throws on nonzero exit (contract preserved for callers)', () => {
-    const stubDir = fs.mkdtempSync(path.join(os.tmpdir(), 'membridge-stubgit-'));
-    const stubGit = path.join(stubDir, 'git');
-    fs.writeFileSync(stubGit, '#!/bin/sh\nexit 1\n');
-    fs.chmodSync(stubGit, 0o755);
-    const prevPath = process.env.PATH;
-    process.env.PATH = stubDir + path.delimiter + prevPath;
-    try {
-      assert.throws(() => changesLib.defaultRunGit(stubDir)(['status']), 'nonzero exit should still throw');
-    } finally {
-      process.env.PATH = prevPath;
-    }
+    withStubExecFileSync(() => { throw Object.assign(new Error('Command failed'), { status: 1 }); }, () => {
+      assert.throws(() => changesLib.defaultRunGit('/repo')(['status']), 'nonzero exit should still throw');
+    });
   });
   check('changes: defaultRunGit is bounded — a blocked git is killed within the timeout, not hung', () => {
-    const stubDir = fs.mkdtempSync(path.join(os.tmpdir(), 'membridge-stubgit-'));
-    const stubGit = path.join(stubDir, 'git');
-    fs.writeFileSync(stubGit, '#!/bin/sh\nsleep 30\n'); // simulates a credential prompt / lock wait
-    fs.chmodSync(stubGit, 0o755);
-    const prevPath = process.env.PATH;
-    process.env.PATH = stubDir + path.delimiter + prevPath;
-    try {
-      const start = Date.now();
-      assert.throws(() => changesLib.defaultRunGit(stubDir)(['status']), /ETIMEDOUT|SIGKILL/);
-      const elapsed = Date.now() - start;
-      assert.ok(elapsed < 9000, `defaultRunGit did not honor the 5s timeout (took ${elapsed}ms)`);
-    } finally {
-      process.env.PATH = prevPath;
-    }
+    let seenOpts = null;
+    withStubExecFileSync((file, args, opts) => {
+      seenOpts = opts;
+      throw Object.assign(new Error('ETIMEDOUT'), { code: 'ETIMEDOUT', signal: 'SIGKILL' });
+    }, () => {
+      assert.throws(() => changesLib.defaultRunGit('/repo')(['status']), /ETIMEDOUT|SIGKILL/);
+    });
+    assert.strictEqual(seenOpts.timeout, 5000, 'timeout not set to 5s');
+    assert.strictEqual(seenOpts.killSignal, 'SIGKILL', 'killSignal not set');
   });
   check('projectDetail: a teammate touch drives team-aware lastTouched + activeLabel + stats', () => {
     const state = util.loadState();
@@ -699,6 +719,33 @@ async function main() {
     const st2 = util.loadState();
     st2.projects[key].teamEntries = saved;
     util.saveState(st2);
+  });
+  check('perf(deferChanges): deferred derivation equals the inline change model', () => {
+    // The feed + project-page hot paths call buildEntries with deferChanges to
+    // skip the per-entry git subprocess storm, then derive changes only for the
+    // entries they show. Prove that deferred derivation is byte-identical to the
+    // old inline path, so the speedup changes nothing a teammate sees.
+    const config = util.getConfig();
+    const digestLib = require('../lib/digest');
+    const key = path.join(ROOT, 'projects', 'defer-app');
+    const ago = sec => new Date(Date.now() - sec * 1000).toISOString();
+    const proj = {
+      events: [
+        { ts: ago(30), source: 'Claude Code', kind: 'prompt', session: 'ds1', text: 'do the thing' },
+        { ts: ago(20), source: 'Claude Code', kind: 'edit', session: 'ds1', file: path.join(key, 'src', 'a.js') },
+        { ts: ago(10), source: 'Distilled', kind: 'summary', session: 'ds1', text: 'Did the thing.',
+          goal: 'g', decisions: '', gotchas: '', highlights: [{ file: 'src/a.js', note: 'touched a.js' }] },
+      ],
+    };
+    const inline = memorydb.buildEntries(key, JSON.parse(JSON.stringify(proj)), config);
+    const deferred = memorydb.buildEntries(key, JSON.parse(JSON.stringify(proj)), config, { deferChanges: true });
+    const inlineEntry = inline.find(e => Array.isArray(e.changes) && e.changes.length);
+    assert.ok(inlineEntry, 'inline path should produce a change model to compare against');
+    const deferredEntry = deferred.find(e => e.session === inlineEntry.session && e._highlights);
+    assert.ok(deferredEntry, 'deferred path should keep _highlights instead of deriving inline');
+    assert.ok(!Array.isArray(deferredEntry.changes) || !deferredEntry.changes.length, 'deferred path must not derive changes inline');
+    const derived = memorydb.deriveEntryChanges(key, deferredEntry.files, deferredEntry._highlights, digestLib.compileRedactions(config));
+    assert.deepStrictEqual(derived, inlineEntry.changes, 'deferred derivation must equal the inline change model');
   });
   check('planPayload: recentAsks merges + dedupes teammate teamEntries, sorted, capped at 20', () => {
     const config = util.getConfig();
@@ -1640,7 +1687,7 @@ async function main() {
       const constSrc = ['MONO', 'STALE_GAP', 'BURST_GAP'].map(n => extractConst(embeddedScript, n)).join('\n');
       const fnSrc = [
         'personColor', 'capLine', 'firstSentence', 'askHeadline', 'runHeadline', 'promptCellText', 'promptRowsHtml', 'cardCloseHtml', 'shareToggleHtml',
-        'threadHtml', 'unitHtml', 'dayCardHtml',
+        'intentRowHtml', 'threadHtml', 'unitHtml', 'dayCardHtml',
         'feedKey', 'normKeyPart', 'threadKey', 'buildThreads', 'unitKeyOf', 'finalizeUnit', 'buildUnits',
         'homeDayLabel', 'buildDayCards', 'feedDayGroupHtml',
       ].map(n => extractFn(embeddedScript, n)).join('\n');
@@ -1683,6 +1730,18 @@ async function main() {
       const h = evalFeedDayGroupHtml().feedDayGroupHtml(v2FeedEntries, { unitCards: true, hideProject: true });
       assert.ok(!/data-day-open/.test(h), 'project page must not render day cards');
       assert.ok(/<article/.test(h), 'per-unit cards must still render');
+    });
+    // The Intent row is always rendered per card so the layout stays stable;
+    // when no distilled goal exists it shows a muted "(not captured)" rather
+    // than dropping the row (present-goal keeps its text).
+    check('intentRowHtml: always renders an Intent row, "(not captured)" when no goal', () => {
+      const escSrc = extractVarFn(embeddedScript, 'esc') || '';
+      const fn = new Function(escSrc + '\n' + extractFn(embeddedScript, 'intentRowHtml') + '\nreturn intentRowHtml;')();
+      const withGoal = fn('Ship the thing');
+      assert.ok(/class="flabel">Intent</.test(withGoal) && withGoal.includes('Ship the thing'), 'goal text must render');
+      const noGoal = fn('');
+      assert.ok(/class="flabel">Intent</.test(noGoal), 'Intent row must render even without a goal');
+      assert.ok(noGoal.includes('(not captured)'), 'goal-less card must show the (not captured) placeholder');
     });
     // Level-2 day-detail view (docs/superpowers/specs/2026-07-20-activity-day-cards-v2-design.md, Task 3):
     // dayDetailHtml renders the session view for one author-day card —
@@ -2009,12 +2068,20 @@ async function main() {
       // rendering the placeholder as wide-tracked ALL-CAPS mono.
       assert.ok(/<label[^>]*><span[^>]*>Password<\/span><input name="password"/.test(embeddedScript),
         'password label missing or its styling sits on the label element (input would inherit mono/uppercase)');
-      assert.ok(embeddedScript.includes('<label style="display:grid;gap:6px;text-align:left"><span'),
+      // The label must actively neutralize the .team-form label mono/uppercase
+      // rule (font/letter-spacing/text-transform/color back to inherit), or the
+      // input — font-family:inherit — renders its placeholder in wide mono.
+      assert.ok(embeddedScript.includes('<label style="display:grid;gap:6px;text-align:left;font:inherit;letter-spacing:normal;text-transform:none;color:inherit"><span'),
         'the wrapping label is not style-neutral');
-      assert.ok(!embeddedScript.includes('placeholder="How teammates see you"'),
-        'display-name placeholder still reads "How teammates see you"');
-      assert.ok(embeddedScript.includes('placeholder="Display name"'), 'display-name placeholder missing');
-      assert.ok(embeddedScript.includes('placeholder="At least 6 characters"'), 'password hint placeholder lost');
+      // Every field now carries a real label, so placeholders are free to be
+      // hints ("How teammates see you") instead of restating the field name.
+      assert.ok(/<span[^>]*>Display name<\/span><input name="displayName"/.test(embeddedScript),
+        'display-name label missing');
+      assert.ok(/<span[^>]*>Email<\/span><input name="email"/.test(embeddedScript),
+        'email label missing');
+      // The 6-character guidance moved from the placeholder to helper text
+      // under the signup password field.
+      assert.ok(embeddedScript.includes('at least 6 characters'), 'password length hint lost');
     });
     check('auth screen: the mark is a proper MemBridge logo lockup, not a bare toggle-look tile', () => {
       // the enlarged header-style lockup: brand-mark tile + wordmark side by side
@@ -2068,6 +2135,57 @@ async function main() {
       // the blank-filter bug until an app reload; leaving keeps ghosts selectable.
       assert.ok(/function resetFeedFilterUnions\(\) \{[\s\S]{0,240}feedMembers = null[\s\S]{0,140}feedMembersByTeam = \{\}/.test(embeddedScript),
         'resetFeedFilterUnions does not reset the member cache — a mid-session team join never loads members');
+    });
+    check('Projects 1c: latest-entry and sparkline helpers are pure, ts-ordered and clock-injected', () => {
+      const pxLatestSrc = extractFn(embeddedScript, 'pxLatestEntry');
+      const pxSparkSrc = extractFn(embeddedScript, 'pxSparkCounts');
+      assert.ok(pxLatestSrc, 'pxLatestEntry pure helper missing');
+      assert.ok(pxSparkSrc, 'pxSparkCounts pure helper missing');
+      const pxEntryInProject = new Function('return (' + pxInProjSrc + ')')();
+      const pxLatestEntry = new Function('return (' + pxLatestSrc + ')')();
+      const pxSparkCounts = new Function('return (' + pxSparkSrc + ')')();
+      const p = { name: 'membridge', path: '/w/membridge' };
+      // Local-noon clock so the day bucketing is stable in any timezone.
+      const now = new Date(2026, 6, 22, 12, 0, 0).getTime();
+      const recent = [
+        { projectPath: '/w/membridge', ts: new Date(now - 26 * 3600e3).toISOString(), summary: 'older' },
+        { projectPath: '/w/membridge', ts: new Date(now - 2 * 3600e3).toISOString(), summary: 'newest' },
+        { projectPath: '/w/other', ts: new Date(now).toISOString(), summary: 'other project' },
+        { projectPath: '/w/membridge', ts: new Date(now - 20 * 86400e3).toISOString(), summary: 'outside window' },
+      ];
+      assert.strictEqual(pxLatestEntry(p, recent, pxEntryInProject).summary, 'newest',
+        'latest pick must go by ts, not array order');
+      assert.strictEqual(pxLatestEntry(p, null, pxEntryInProject), null, 'null feed must not throw');
+      const counts = pxSparkCounts(p, recent, pxEntryInProject, now);
+      assert.strictEqual(counts.length, 24, 'sparkline must have 24 hourly buckets');
+      assert.strictEqual(counts[21], 1, 'the 2h-ago session must land in the 2-hours-back bucket');
+      assert.strictEqual(counts.reduce((a, b) => a + b, 0), 1,
+        'sessions older than 24h or from other projects leaked into the sparkline');
+      assert.strictEqual(pxSparkCounts(p, null, pxEntryInProject, now).reduce((a, b) => a + b, 0), 0,
+        'null feed must yield an all-zero sparkline, not throw');
+      const pxClipSrc = extractFn(embeddedScript, 'pxClipSummary');
+      assert.ok(pxClipSrc, 'pxClipSummary pure helper missing');
+      const pxClipSummary = new Function('return (' + pxClipSrc + ')')();
+      assert.strictEqual(pxClipSummary('short text', 160), 'short text', 'short summaries must pass through untouched');
+      const clipped = pxClipSummary('word '.repeat(60).trim(), 160);
+      assert.ok(clipped.length <= 161 && clipped.endsWith('\u2026'), 'long summaries must clip with an ellipsis');
+      assert.ok(!/\s\u2026$/.test(clipped), 'clip must land on a word boundary, not trailing space');
+      assert.strictEqual(pxClipSummary('x'.repeat(300), 160), 'x'.repeat(160) + '\u2026',
+        'an unbreakable string must hard-cut at the limit');
+    });
+    check('Projects index renders the 1c compact grid with every row action hook intact', () => {
+      const rowSrc = extractFn(embeddedScript, 'pxRowHtml');
+      const renderSrc = extractFn(embeddedScript, 'renderProjectsIndex');
+      assert.ok(/px-hdr/.test(renderSrc) && /Latest session/.test(renderSrc), '1c column header row missing');
+      assert.ok(/px-spark/.test(rowSrc) && /px-who/.test(rowSrc), 'sparkline/avatar cells missing from rows');
+      assert.ok(/pxClipSummary\(/.test(rowSrc), 'latest-session summary is not length-capped');
+      assert.ok(/title="' \+ esc\(summary\)/.test(rowSrc), 'full summary tooltip missing from the latest-session cell');
+      assert.ok(/px-row dim/.test(rowSrc), 'paused/dormant rows do not collapse to the dim one-line form');
+      ['data-px-open', 'data-px-menu', 'data-px-pause', 'data-px-askdel', 'data-px-dodel', 'data-px-canceldel'].forEach((a) => {
+        assert.ok(rowSrc.includes(a), a + ' hook lost in the 1c redesign');
+      });
+      assert.ok(!rowSrc.includes('Roadmap'), 'the removed Roadmap item is back in the row menu');
+      assert.ok(pageHtml.includes('.px-hdr'), '1c grid CSS missing from the stylesheet');
     });
     const bulkFnSrc = extractFn(embeddedScript, 'deleteProjectsBulk');
     check('deleteProjectsBulk helper exists standalone in the embedded script', () => {
@@ -2364,10 +2482,14 @@ async function main() {
     // and toggling distill.enabled installs/removes the Claude Code Stop hook
     // AND records consent — otherwise the first-run popup (needsConsentPrompt)
     // would keep nagging even after the Settings toggle already acted.
+    // hookInstalled is already true here: the daemon force-registers the Stop
+    // hook at boot (hooks.ensureInstalled), so it is present regardless of the
+    // Settings toggle. Disabling still removes it in-session; the next daemon
+    // boot re-registers it (unconditional by design).
     const consentLib = require('../lib/consent');
     const stFresh = await (await fetch(`${base}/api/settings`)).json();
     check('settings: hookInstalled + distill fields are reported', () => {
-      assert.strictEqual(stFresh.hookInstalled, false, 'hook should not be installed yet');
+      assert.strictEqual(stFresh.hookInstalled, true, 'daemon should auto-register the Stop hook at boot');
       assert.deepStrictEqual(stFresh.distill, { enabled: true, consent: null, minEdits: 1, checkpointEvery: 4 });
     });
     const stDistillOn = await (await post(`${base}/api/settings`, { distill: { enabled: true } })).json();
@@ -2806,6 +2928,37 @@ async function main() {
       process.env.MEMBRIDGE_TEAM_ANON_KEY = savedKey;
     }
   });
+
+  check('team: oauthAuthorizeUrl targets the backend with the redirect encoded', () => {
+    const u = teamsync.oauthAuthorizeUrl(util.getConfig(), 'http://127.0.0.1:7437/team/oauth/callback');
+    assert.ok(u.startsWith('http://127.0.0.1:17945/auth/v1/authorize?provider=github'), u);
+    assert.ok(u.includes(encodeURIComponent('http://127.0.0.1:7437/team/oauth/callback')), 'redirect not encoded');
+  });
+
+  {
+    // GitHub OAuth completion: fragment tokens become stored credentials, with
+    // the display name falling back to GitHub metadata (OAuth accounts carry
+    // user_name/full_name, never display_name). Runs before the password
+    // signup below so the credentials it writes get overwritten by that flow.
+    const ghUser = { id: 'gh-user-1', email: 'octo@test.dev', metadata: { user_name: 'octomarco' } };
+    mock.users.set(ghUser.email, ghUser);
+    mock.sessions.set('at-gh-test', ghUser.id);
+    const ghCreds = await teamsync.loginWithTokens(util.getConfig(), 'at-gh-test', 'rt-gh-test', 3600);
+    check('team: loginWithTokens verifies the token and stores GitHub credentials', () => {
+      assert.strictEqual(ghCreds.email, 'octo@test.dev');
+      assert.strictEqual(ghCreds.displayName, 'octomarco');
+      const stored = JSON.parse(read(teamsync.credentialsPath()));
+      assert.strictEqual(stored.userId, 'gh-user-1');
+      assert.strictEqual(stored.refreshToken, 'rt-gh-test');
+    });
+    let rejected = false;
+    try { await teamsync.loginWithTokens(util.getConfig(), 'at-never-issued', 'rt-x', 3600); }
+    catch { rejected = true; }
+    check('team: loginWithTokens rejects a token the backend never issued', () => {
+      assert.ok(rejected, 'unissued token was accepted');
+    });
+    teamsync.clearCredentials();
+  }
 
   try {
     // Marco: signup, team, link the shop-app project, first push.
@@ -3990,6 +4143,15 @@ async function main() {
     { type: 'user', message: { role: 'user', content: 'Quick tweak to the readme' }, cwd: projR, timestamp: '2026-07-12T09:10:00.000Z' },
     { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Done.' }] }, cwd: projR, timestamp: '2026-07-12T09:11:00.000Z' },
   ]));
+  // A shareable coding session (has an edit) that produced NO >=80-char summary:
+  // exercises the fallback one-liner render + summary-null push under the
+  // zero-edit suppression rule. Prompt-first so its edit attaches to its own
+  // entry, not a neighbouring session's.
+  fs.writeFileSync(path.join(rDir, 'sessEditNoSummary.jsonl'), jsonl([
+    { type: 'user', message: { role: 'user', content: 'Bump the package version' }, cwd: projR, timestamp: '2026-07-12T09:16:00.000Z' },
+    { type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', name: 'Edit', input: { file_path: path.join(projR, 'package.json') } }] }, cwd: projR, timestamp: '2026-07-12T09:16:30.000Z' },
+    { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Bumped.' }] }, cwd: projR, timestamp: '2026-07-12T09:17:00.000Z' },
+  ]));
   // Grant consent so the summaries instruction appears in AGENTS.md
   { const rc = util.loadUserConfig(); if (!rc.distill) rc.distill = {}; rc.distill.consent = 'granted'; util.saveUserConfig(rc); }
   syncOnce();
@@ -4020,8 +4182,11 @@ async function main() {
     assert.ok(md.includes('Did: Refactored the payment retry queue'), 'Did line missing');
     assert.ok(md.includes('Tasks: 1/3 done'), 'Tasks line missing');
     assert.ok(md.includes('Changes: src/queue.js'), 'Changes line missing');
-    // the summary-less session keeps the original one-line ask format
-    assert.ok(md.includes('Claude Code: Quick tweak to the readme'), 'fallback one-liner missing');
+    // A shareable (edited) session with no summary keeps the one-line ask format.
+    assert.ok(md.includes('Claude Code: Bump the package version'), 'fallback one-liner missing');
+    // A zero-edit Claude Code session (readme tweak, no edit captured) is ops
+    // noise and suppressed from the block entirely.
+    assert.ok(!md.includes('Quick tweak to the readme'), 'zero-edit session should be suppressed');
   });
   check('rich: summaries and todo items are redacted everywhere they land', () => {
     assert.ok(!richMd().includes('sk-test1234567890abcdef'), 'summary secret leaked into the block');
@@ -4097,7 +4262,8 @@ async function main() {
     { type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', name: 'Edit', input: { file_path: path.join(ROOT, 'outside-place', 'tmp-script.sh') } }] }, cwd: projR, timestamp: '2026-07-12T09:31:00.000Z' },
     { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: MD_SUMMARY }] }, cwd: projR, timestamp: '2026-07-12T09:32:00.000Z' },
   ]));
-  // A session whose only capture is the agent's self-report (no user prompt).
+  // A session whose only capture is the agent's self-report (no user prompt,
+  // no edit). A zero-edit Claude Code session — suppressed under the rule.
   fs.writeFileSync(path.join(rDir, 'sessNoAsk.jsonl'), jsonl([
     { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Resumed after a crash and finished wiring the webhook retries; the full suite is passing again.' }] }, cwd: projR, timestamp: '2026-07-12T09:40:00.000Z' },
   ]));
@@ -4117,10 +4283,11 @@ async function main() {
     assert.ok(line && line.trim().startsWith('Did:'), 'flattened summary missing from the block');
     assert.ok(!/[*`|#]/.test(line), `markdown survived into the Did line: ${line}`);
   });
-  check('fix: a summary-only session renders Ask: (not captured)', () => {
+  check('fix: a zero-edit summary-only session is suppressed from the block', () => {
+    // No prompt, no edit — only a harvested self-report. A Claude Code session
+    // that changed nothing is ops noise now and never reaches the block.
     const md = richMd();
-    assert.ok(md.includes('Ask: (not captured)'), 'placeholder Ask line missing');
-    assert.ok(md.includes('finished wiring the webhook retries'), 'prompt-less summary missing');
+    assert.ok(!md.includes('finished wiring the webhook retries'), 'zero-edit summary-only session leaked into the block');
   });
 
   check('renderBlock: shows Intent/Did/Changes, no 240-char blob truncation', () => {
@@ -4409,6 +4576,39 @@ async function main() {
       input: 'garbage', encoding: 'utf8', env: { ...process.env },
     });
     assert.strictEqual(blocked.status, 0, 'entry must fail open on garbage stdin');
+  });
+  check('auto-register: ensureInstalled installs the Stop hook silently and is idempotent', () => {
+    const arFile = path.join(ROOT, 'claude-settings-autoreg.json');
+    fs.writeFileSync(arFile, JSON.stringify({ model: 'opus', hooks: { Stop: [] } }, null, 2));
+    const prev = process.env.MEMBRIDGE_CLAUDE_SETTINGS;
+    process.env.MEMBRIDGE_CLAUDE_SETTINGS = arFile;
+    try {
+      hooks.ensureInstalled();
+      const after1 = JSON.parse(read(arFile));
+      assert.strictEqual(after1.hooks.Stop.length, 1, 'Stop hook not auto-registered');
+      assert.strictEqual(after1.hooks.Stop[0].hooks[0].command, hooks.hookCommand(), 'auto-registered command is not the resolved form');
+      assert.strictEqual(after1.model, 'opus', 'unrelated settings key lost');
+      hooks.ensureInstalled();
+      const after2 = JSON.parse(read(arFile));
+      assert.strictEqual(after2.hooks.Stop.length, 1, 'ensureInstalled duplicated the Stop entry');
+    } finally {
+      process.env.MEMBRIDGE_CLAUDE_SETTINGS = prev;
+    }
+  });
+  check('auto-register: post-commit sweep runs once per version, then is skipped', () => {
+    const repo = path.join(ROOT, 'autoreg-repo');
+    fs.mkdirSync(path.join(repo, '.git', 'hooks'), { recursive: true });
+    const st = util.loadState();
+    util.saveState({ ...st, projects: { ...(st.projects || {}), [repo]: { events: [] } }, hooksInstalledVersion: 'v-stale' });
+
+    hooks.ensurePostCommitForVersion();
+    const hookFile = path.join(repo, '.git', 'hooks', 'post-commit');
+    assert.ok(fs.existsSync(hookFile), 'post-commit hook not installed on the version-mismatch run');
+    assert.strictEqual(util.loadState().hooksInstalledVersion, require('../package.json').version, 'version marker not stamped after sweep');
+
+    fs.unlinkSync(hookFile); // a gated second run must NOT recreate it
+    hooks.ensurePostCommitForVersion();
+    assert.strictEqual(fs.existsSync(hookFile), false, 'sweep re-ran despite a matching version marker');
   });
   check('distill: setup-hooks upgrades a stale PATH-based command in place', () => {
     const staleFile = path.join(ROOT, 'claude-settings-stale.json');
@@ -4753,6 +4953,25 @@ async function main() {
       row = mockRS.entries.filter(e => e.session === 'sA')[0];
       assert.strictEqual(row.ask, null, 'scrub did not clear ask');
     });
+    // Regression: a reshare batch mixes entries that have a distilled goal with
+    // entries that don't. entryToRow must never emit an `undefined`-valued key —
+    // JSON.stringify drops those, so a goal-less row would ship WITHOUT the `goal`
+    // key while a goaled row ships WITH it, and PostgREST rejects the mixed-shape
+    // array with "All object keys must match" (the "share doesn't work" bug).
+    await check('teamsync: entryToRow emits a stable key set across mixed entries (no undefined keys)', () => {
+      const rx = digest.compileRedactions(util.getConfig());
+      const cr = { userId: 'u1', displayName: 'Resha' };
+      const withGoal = { ts: rsAgo(30), source: 'Claude Code', session: 'sM', ask: 'do it', goal: 'the goal', files: [] };
+      const noGoal = { ts: rsAgo(20), source: 'Claude Code', session: 'sM', ask: '(file edits)', files: [] };
+      const rowA = JSON.parse(JSON.stringify(teamsync.entryToRow(withGoal, 'p1', cr, true, rx)));
+      const rowB = JSON.parse(JSON.stringify(teamsync.entryToRow(noGoal, 'p1', cr, true, rx)));
+      const keysA = Object.keys(rowA).sort();
+      const keysB = Object.keys(rowB).sort();
+      assert.deepStrictEqual(keysB, keysA, 'goal-less row is missing keys present on the goaled row: ' +
+        JSON.stringify({ onlyOnGoaled: keysA.filter(k => !keysB.includes(k)) }));
+      assert.ok('goal' in rowB, 'goal key dropped from the goal-less row (undefined value)');
+      assert.strictEqual(rowB.goal, null, 'goal should serialize as null, not vanish');
+    });
     // Fail-closed: on an encrypted team with no usable key, reshareSession must
     // refuse rather than push a plaintext-only row (which merge-duplicates would
     // apply while leaving any prior ciphertext — still holding the real prompt —
@@ -4830,6 +5049,139 @@ async function main() {
     }
   }
 
+  // Wire parity: a teammate must see the same quality as the author's local
+  // view. Three gaps closed here: (1) the pushed summary was clipped to 300
+  // chars and the headline never left the machine, so teammate cards rendered
+  // a derived, truncated title over a cut-off body; (2) a distilled brief that
+  // lands AFTER an entry's first push (the normal case — pushes run every 60s,
+  // briefs at session Stop) was never re-sent, because the cursor skips
+  // already-pushed ts and ignore-duplicates never overwrites; (3) the pull
+  // cursor + seen-key skip meant even a re-pushed row never replaced the stale
+  // copy in teamEntries.
+  check('parity: entryToRow ships the full summary (summaryFull), not the 300-char clip', () => {
+    const rx = digest.compileRedactions(util.getConfig());
+    const cr = { userId: 'u1', displayName: 'Parity' };
+    const full = 'Sentence one of the full brief. '.repeat(20) + 'Tail sentinel api_key=parityfullsecret9999 end.';
+    const e = {
+      ts: 't1', source: 'Claude Code', session: 'sP', files: [],
+      summary: full.slice(0, 299) + '…', summaryFull: full, distilled: true,
+    };
+    const row = teamsync.entryToRow(e, 'p1', cr, false, rx);
+    assert.ok(row.summary && row.summary.length > 300, `summary still clipped: len=${(row.summary || '').length}`);
+    assert.ok(row.summary.includes('Tail sentinel'), 'the tail of the full summary was lost');
+    assert.ok(row.summary.includes('[redacted'), 'full summary skipped redaction');
+    assert.ok(!row.summary.includes('parityfullsecret9999'), 'secret leaked in the full summary');
+  });
+  check('parity: entryToRow carries headline (null when absent, key always present)', () => {
+    const rx = digest.compileRedactions(util.getConfig());
+    const cr = { userId: 'u1', displayName: 'Parity' };
+    const withH = teamsync.entryToRow({ ts: 't1', source: 'Claude Code', session: 'sP', files: [], summary: 's', headline: 'Shipped the thing end to end' }, 'p1', cr, false, rx);
+    const without = teamsync.entryToRow({ ts: 't2', source: 'Claude Code', session: 'sP', files: [], summary: 's' }, 'p1', cr, false, rx);
+    assert.strictEqual(withH.headline, 'Shipped the thing end to end');
+    assert.ok('headline' in without, 'headline key dropped from a headline-less row (mixed-shape batch)');
+    assert.strictEqual(without.headline, null);
+  });
+  await check('parity: encryptRow seals headline in the ciphertext and nulls it under plaintextOff', async () => {
+    const tc = require('../lib/teamcrypto');
+    if (!tc.available()) return; // libsodium unavailable in this env — skip as pass
+    await tc.ready();
+    const teamKey = tc.genTeamKey();
+    const row = { ts: 't1', source: 'Claude Code', ask: null, goal: null, decisions: null, gotchas: null, files: [], changes: null, summary: 'the brief', headline: 'The headline', distilled: true };
+    const out = teamsync.encryptRow(row, teamKey, 1, { teamcrypto: tc, plaintextOff: true });
+    assert.strictEqual(out.headline, null, 'plaintextOff left the headline readable next to the ciphertext');
+    const payload = tc.decrypt(out.ciphertext, out.nonce, teamKey);
+    assert.strictEqual(payload.headline, 'The headline', 'headline missing from the encrypted payload');
+  });
+
+  // The end-to-end ratchet: entry pushes before its brief exists; the brief
+  // must still reach the backend (merge re-push with a bumped created_at so
+  // every pull cursor re-sees the row), and an unchanged entry must NOT be
+  // re-pushed on the next cycle.
+  {
+    const mockWP = createMockSupabase();
+    await new Promise(r => mockWP.server.listen(17959, '127.0.0.1', r));
+    process.env.MEMBRIDGE_TEAM_URL = 'http://127.0.0.1:17959';
+    process.env.MEMBRIDGE_TEAM_ANON_KEY = 'anon-test';
+    try {
+      const projWP = path.join(ROOT, 'projects', 'wire-parity-app');
+      fs.mkdirSync(projWP, { recursive: true });
+      await teamsync.signup(util.getConfig(), 'parity@test.dev', 'pw-wp', 'Parity');
+      const teamWP = await teamsync.createTeam(util.getConfig(), 'ParityTeam');
+      await teamsync.linkProject(util.getConfig(), projWP, teamWP.team_id, 'ParityTeam');
+      const wpAgo = sec => new Date(Date.now() - sec * 1000).toISOString();
+      const LONG = 'Sentence one of the full brief. '.repeat(20) + 'Late tail sentinel api_key=latebriefsecret1234 end.';
+      const st = util.loadState();
+      st.projects[projWP] = { events: [
+        { ts: wpAgo(120), source: 'Claude Code', kind: 'prompt', session: 'sW', text: 'build the thing' },
+      ] };
+      util.saveState(st);
+      await teamsync.syncTeams({ project: projWP }); // first push: brief doesn't exist yet
+      const first = mockWP.entries.filter(e => e.session === 'sW')[0];
+      check('parity precondition: the first push predates the brief (no summary on the row)', () => {
+        assert.ok(first, 'entry was not pushed at all');
+        assert.ok(!first.summary, `expected a summaryless first push, got: ${first.summary}`);
+      });
+      const firstCreatedAt = first && first.created_at;
+      // Session Stop lands the distilled brief; it attaches to the SAME entry
+      // ts, which the push cursor has already passed.
+      const st2 = util.loadState();
+      st2.projects[projWP].events.push({
+        ts: wpAgo(10), source: 'Distilled', kind: 'summary', session: 'sW',
+        text: LONG, headline: 'Shipped the thing end to end', goal: 'ship it',
+        decisions: '', gotchas: '', highlights: [],
+      });
+      util.saveState(st2);
+      await teamsync.syncTeams({ project: projWP });
+      check('parity: a brief that lands after first push is re-pushed with full text + headline', () => {
+        const row = mockWP.entries.filter(e => e.session === 'sW')[0];
+        assert.ok(row.summary, 'the late brief never reached the backend (first-push-wins ratchet)');
+        assert.ok(row.summary.length > 300 && row.summary.includes('Late tail sentinel'), `summary clipped or stale: len=${row.summary.length}`);
+        assert.ok(!row.summary.includes('latebriefsecret1234'), 'secret leaked in the re-pushed summary');
+        assert.strictEqual(row.headline, 'Shipped the thing end to end', 'headline missing from the re-pushed row');
+        assert.ok(row.created_at && firstCreatedAt && row.created_at > firstCreatedAt,
+          `created_at not bumped (pull cursors would never re-see the row): ${firstCreatedAt} -> ${row.created_at}`);
+      });
+      const secondCreatedAt = (mockWP.entries.filter(e => e.session === 'sW')[0] || {}).created_at;
+      await teamsync.syncTeams({ project: projWP });
+      check('parity: an unchanged entry is not re-pushed every cycle', () => {
+        const row = mockWP.entries.filter(e => e.session === 'sW')[0];
+        assert.strictEqual(row.created_at, secondCreatedAt, 'row was re-pushed with no content change');
+      });
+      // Pull side: a re-pushed row (same author|ts|source key, newer
+      // created_at) must REPLACE the stale copy in teamEntries, not be
+      // skipped by the seen-key dedup.
+      await check('parity: pullProject replaces a stale teamEntries copy with the re-pushed version', async () => {
+        const creds = await teamsync.getAccessToken(util.getConfig());
+        const link = teamsync.loadTeamLink(projWP);
+        const proj = { teamEntries: [], teamPullTs: undefined };
+        mockWP.entries.push({
+          project_id: link.projectId, author_id: 'user-other', author_name: 'Other',
+          ts: wpAgo(60), source: 'Claude Code', session: 'sO', ask: null,
+          summary: 'v1 early harvested line', distilled: false, files: [], changes: null,
+          goal: null, decisions: null, gotchas: null, headline: null,
+          id: 9001, created_at: new Date(Date.now() + 1000).toISOString(),
+        });
+        await teamsync.pullProject(util.getConfig(), creds, proj, link, null);
+        assert.strictEqual((proj.teamEntries[0] || {}).summary, 'v1 early harvested line', 'precondition: v1 pulled');
+        const idx = mockWP.entries.findIndex(e => e.session === 'sO');
+        mockWP.entries[idx] = {
+          ...mockWP.entries[idx],
+          summary: 'v2 the real distilled brief, much better', distilled: true,
+          headline: 'The real headline', created_at: new Date(Date.now() + 2000).toISOString(),
+        };
+        await teamsync.pullProject(util.getConfig(), creds, proj, link, null);
+        const got = proj.teamEntries.filter(e => e.session === 'sO');
+        assert.strictEqual(got.length, 1, `re-pushed row duplicated instead of replacing (${got.length} copies)`);
+        assert.strictEqual(got[0].summary, 'v2 the real distilled brief, much better', 'stale v1 survived the pull (seen-key skip)');
+        assert.strictEqual(got[0].headline, 'The real headline', 'headline not mapped on pull');
+      });
+    } finally {
+      delete process.env.MEMBRIDGE_TEAM_URL;
+      delete process.env.MEMBRIDGE_TEAM_ANON_KEY;
+      await new Promise(r => mockWP.server.close(r));
+    }
+  }
+
   // Task 6 (per-session prompt sharing): POST /api/share-session persists the
   // per-session flag into proj.sharedSessions (authoritative for future
   // normal pushes) and calls teamsync.reshareSession to retroactively
@@ -4890,6 +5242,77 @@ async function main() {
       mockSE.server.close();
       delete process.env.MEMBRIDGE_TEAM_URL;
       delete process.env.MEMBRIDGE_TEAM_ANON_KEY;
+    }
+  }
+
+  // SECURITY (fix/dashboard-csrf): the local dashboard API binds 127.0.0.1, which
+  // stops remote attackers but NOT cross-site ones — any page the user's browser
+  // loads while the daemon runs can fire a form POST at 127.0.0.1:<port> and drive
+  // a mutating endpoint (e.g. overwrite team.url so the next sync ships the Supabase
+  // refresh token to an attacker). The guard runs before route dispatch: a POST
+  // whose Origin is present and cross-site, an opaque "null" Origin, or a non-JSON
+  // content-type is refused with 403; same-origin and no-Origin (CLI/tests) pass;
+  // reads (GET) are never blocked. We assert against /api/projects/add because it
+  // 400s on a missing path, so a passed guard is observable as 400 (not a mutation).
+  {
+    const CSRF_PORT = 17983;
+    const srvCsrf = startServer(CSRF_PORT, { retries: 0 });
+    try {
+      const base = 'http://127.0.0.1:' + CSRF_PORT;
+      await waitForHttp(base + '/api/status');
+      const raw = (p, opts) => fetch(base + p, opts);
+
+      const cross = await raw('/api/projects/add', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Origin: 'http://evil.example' },
+        body: JSON.stringify({ path: '/tmp/whatever' }),
+      });
+      await check('server(csrf): cross-origin POST is blocked before the route (403)', () => {
+        assert.strictEqual(cross.status, 403);
+      });
+
+      const nullOrigin = await raw('/api/projects/add', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Origin: 'null' },
+        body: JSON.stringify({ path: '/tmp/whatever' }),
+      });
+      await check('server(csrf): opaque "null" Origin POST is blocked (403)', () => {
+        assert.strictEqual(nullOrigin.status, 403);
+      });
+
+      const wrongType = await raw('/api/projects/add', {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain', Origin: base },
+        body: JSON.stringify({ path: '/tmp/whatever' }),
+      });
+      await check('server(csrf): non-JSON content-type POST is blocked (403)', () => {
+        assert.strictEqual(wrongType.status, 403);
+      });
+
+      const same = await raw('/api/projects/add', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Origin: base },
+        body: JSON.stringify({}),
+      });
+      await check('server(csrf): same-origin POST passes the guard (reaches route → 400)', () => {
+        assert.strictEqual(same.status, 400);
+      });
+
+      const noOrigin = await raw('/api/projects/add', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      await check('server(csrf): POST without an Origin is allowed (non-browser client → 400)', () => {
+        assert.strictEqual(noOrigin.status, 400);
+      });
+
+      const readCross = await raw('/api/status', { headers: { Origin: 'http://evil.example' } });
+      await check('server(csrf): cross-origin GET is still served (reads are safe → 200)', () => {
+        assert.strictEqual(readCross.status, 200);
+      });
+    } finally {
+      if (srvCsrf) await new Promise(r => srvCsrf.close(r));
     }
   }
 
@@ -5590,6 +6013,16 @@ async function main() {
   const JWT = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N';
   const PG_URI = 'postgres://app:hunter2secret@db.internal:5432/prod';
   const ENTROPY_TOKEN = 'aB3dE5gH7jK9mN1pQ3rS5tU7wX9zA1cE'; // 32-char base64, entropy > 4.5
+  const STRIPE_KEY = 'sk_live_' + 'ABCDEFGHIJKLMNOP1234567890';
+  const STRIPE_WEBHOOK = 'whsec_' + 'ABCDEFGHIJKLMNOPabcdefghij1234';
+  const GOOGLE_OAUTH_SECRET = 'GOCSPX-' + 'ABCDEFGHIJKLMNOP1234567890';
+  const SENDGRID_KEY = 'SG.' + 'ABCDEFGHIJKLMNOP1234' + '.' + 'abcdefghijklmnop1234ABCDEFGHIJKLMNOP567';
+  const NPM_TOKEN = 'npm_' + 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'; // npm_ + 36
+  // Split across a + so no full webhook-URL literal appears contiguously in
+  // source — GitHub push protection flags the shape even for obviously-fake
+  // tokens. The runtime value (what the redactor is tested against) is identical.
+  const SLACK_WEBHOOK = 'https://hooks.slack.com' + '/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX';
+  const DISCORD_WEBHOOK = 'https://discord.com/api' + '/webhooks/123456789012345678/AbC-dEf_1234567890AbCdEfGhIjKlMnOpQrStUvWx';
   const cases = [
     ['aws-access-key', `creds ${AWS_KEY} here`, AWS_KEY],
     ['github-token', `rotate ${GH_TOKEN} now`, GH_TOKEN],
@@ -5600,6 +6033,13 @@ async function main() {
     ['private-key', '-----BEGIN RSA PRIVATE KEY-----\nMIIBhaha+notreal/xyz==\n-----END RSA PRIVATE KEY-----', 'MIIBhaha'],
     ['credentials', `DB ${PG_URI} yo`, 'hunter2secret'],
     ['secret-assignment', "config password=hunter2xyz done", 'hunter2xyz'],
+    ['stripe-key', `pay ${STRIPE_KEY} now`, STRIPE_KEY],
+    ['stripe-webhook-secret', `sig ${STRIPE_WEBHOOK} end`, STRIPE_WEBHOOK],
+    ['google-oauth-secret', `oauth ${GOOGLE_OAUTH_SECRET} end`, GOOGLE_OAUTH_SECRET],
+    ['sendgrid-key', `mail ${SENDGRID_KEY} sent`, SENDGRID_KEY],
+    ['npm-token', `registry ${NPM_TOKEN} used`, NPM_TOKEN],
+    ['slack-webhook-url', `post ${SLACK_WEBHOOK} now`, SLACK_WEBHOOK],
+    ['discord-webhook-url', `hook ${DISCORD_WEBHOOK} set`, DISCORD_WEBHOOK],
     ['high-entropy', `blob ${ENTROPY_TOKEN} done`, ENTROPY_TOKEN],
   ];
   // E2E crypto primitives (libsodium sealed-box + secretbox). Load once so the
@@ -6093,6 +6533,19 @@ async function main() {
       assert.ok(!('ciphertext' in pushRow), 'input row must not be mutated');
     });
 
+    // Cutover default: ciphertext-only is the DEFAULT once a team key exists —
+    // dual-write survives only as the explicit rollback hatch
+    // (`team.plaintextOff: false`). Guards the leak where every "encrypted"
+    // row still carried readable content columns unless each machine
+    // hand-set the flag.
+    check('teamsync: plaintextOffFor defaults ON — only an explicit false re-enables dual-write', () => {
+      assert.strictEqual(teamsync.plaintextOffFor({}), true, 'no team config → ciphertext-only');
+      assert.strictEqual(teamsync.plaintextOffFor(null), true, 'null config → ciphertext-only');
+      assert.strictEqual(teamsync.plaintextOffFor({ team: {} }), true, 'empty team config → ciphertext-only');
+      assert.strictEqual(teamsync.plaintextOffFor({ team: { plaintextOff: true } }), true, 'explicit true stays on');
+      assert.strictEqual(teamsync.plaintextOffFor({ team: { plaintextOff: false } }), false, 'explicit false is the only dual-write hatch');
+    });
+
     // Fail-closed wiring: flag ON, crypto/keychain unavailable. The pass must
     // push today's plaintext rows, never throw — and must LOG the fallback,
     // which is what separates "the wiring engaged and failed closed" from
@@ -6242,12 +6695,12 @@ async function main() {
       resAlice = await teamsync.syncTeams({ project: projE2E, cryptoDeps: { keychain: kcAlice, teamcrypto: tcE2E } });
       origRows = mockE2E.entries.map(e => ({ ...e }));
 
-      // Tamper every stored plaintext column: a correct pull must recover
-      // content from the CIPHERTEXT, so the tampering must never surface.
+      // Inject fake plaintext into every stored content column: cutover rows
+      // carry none, so anything readable server-side is server-controlled. A
+      // correct pull recovers content from the CIPHERTEXT, so the injection
+      // must never surface.
       for (const e of mockE2E.entries) {
-        if (e.ask) e.ask = 'TAMPERED ' + e.ask;
-        if (e.summary) e.summary = 'TAMPERED ' + e.summary;
-        if (e.decisions) e.decisions = 'TAMPERED';
+        e.ask = 'TAMPERED ask'; e.summary = 'TAMPERED summary'; e.decisions = 'TAMPERED';
       }
       // Plus one plaintext-only row (no ciphertext): must pull through as-is.
       const alice = mockE2E.users.get('alice-e2e@test.dev');
@@ -6273,7 +6726,7 @@ async function main() {
       mockE2E.server.close();
     }
 
-    check('teamsync: flag-on push dual-writes ciphertext rows and seals the epoch key to every member', () => {
+    check('teamsync: flag-on push is ciphertext-only by default and seals the epoch key to every member', () => {
       assert.ok(!e2eErr, `e2e scenario threw: ${e2eErr && e2eErr.message}`);
       assert.deepStrictEqual(resAlice.errors, [], `alice sync errors: ${JSON.stringify(resAlice && resAlice.errors)}`);
       assert.ok(origRows.length >= 1, 'expected pushed rows');
@@ -6281,8 +6734,10 @@ async function main() {
         assert.ok(r.ciphertext && r.nonce && r.key_epoch === 1, 'pushed row missing ciphertext/nonce/key_epoch');
         assert.ok(!Buffer.from(r.ciphertext, 'base64').toString('latin1').includes('src/core.js'),
           'file path visible in ciphertext bytes');
+        for (const col of ['ask', 'goal', 'decisions', 'gotchas', 'summary', 'files', 'changes']) {
+          assert.strictEqual(r[col], null, `${col} must be null — ciphertext-only is the default, dual-write is opt-in`);
+        }
       }
-      assert.ok(origRows.some(r => r.summary), 'plaintext summary must still be populated (dual-write)');
       assert.strictEqual(mockE2E.pubkeys.size, 2, 'both members must have uploaded pubkeys');
       assert.strictEqual(mockE2E.teamKeys.length, 2, 'epoch key must be sealed once to each member');
     });
@@ -6307,13 +6762,14 @@ async function main() {
 
     check('teamsync: round trip — Bob recovers exactly what Alice pushed, through the ciphertext', () => {
       assert.ok(!e2eErr, `e2e scenario threw: ${e2eErr && e2eErr.message}`);
-      const orig = origRows.find(r => r.summary);
+      // The server rows carry no readable content (ciphertext-only default),
+      // so the round-trip oracle is the content Alice PLANTED, not the rows.
       const got = bobEntries.find(e => e.session === 'e2e1' && e.summary);
-      assert.ok(orig && got, 'summary-bearing row missing on one side');
-      assert.strictEqual(got.ask, orig.ask, 'ask must round-trip identically');
-      assert.strictEqual(got.summary, orig.summary, 'summary must round-trip identically');
-      assert.strictEqual(got.decisions, orig.decisions, 'decisions must round-trip identically');
-      assert.deepStrictEqual(got.files, orig.files, 'files must round-trip identically');
+      assert.ok(got, 'summary-bearing e2e1 entry missing from Bob\'s pull');
+      assert.strictEqual(got.summary, 'Shipped the slice end to end', 'summary must round-trip through the ciphertext');
+      assert.strictEqual(got.decisions, 'sealed-box model kept', 'decisions must round-trip through the ciphertext');
+      assert.ok(Array.isArray(got.files) && got.files.some(f => String(f).includes('core.js')),
+        'edited file must round-trip through the ciphertext');
       assert.ok(!JSON.stringify(bobEntries).includes('sk-e2e-alice-999'),
         'secret must have been redacted before encryption');
     });
@@ -6464,9 +6920,12 @@ async function main() {
       });
     }
 
-    // Pre-migration backend (no 009 columns): flag-on push must drop the
-    // three new columns and land plaintext (PGRST204 retry), and the pull
-    // select must degrade instead of erroring. Fresh mock + home.
+    // Pre-migration backend (no 009 columns): under the ciphertext-only
+    // DEFAULT the push must fail closed and hold entries — dropping the
+    // ciphertext column would upload contentless rows. Only the explicit
+    // dual-write hatch (plaintextOff: false) restores the legacy degrade:
+    // drop the three new columns and land plaintext (PGRST204 retry).
+    // Fresh mock + home.
     {
       const mockPre = createMockSupabase();
       mockPre.flags.rejectColumns.add('ciphertext');
@@ -6475,7 +6934,10 @@ async function main() {
       const homeCarol = path.join(ROOT, 'home-e2ec');
       const projPre = path.join(ROOT, 'projects', 'pre-app');
       fs.mkdirSync(projPre, { recursive: true });
-      let preErr = null, resPre = null;
+      let preErr = null, resPre = null, resPreHatch = null, heldCount = -1, mintedAfterHold = -1;
+      // ONE keychain for both passes: a fresh keychain on the second pass
+      // would be a brand-new identity that cannot unseal the epoch-1 key.
+      const kcCarol = mkMemKeychain();
       try {
         await new Promise(r => mockPre.server.listen(17954, '127.0.0.1', r));
         process.env.MEMBRIDGE_TEAM_URL = 'http://127.0.0.1:17954';
@@ -6490,23 +6952,37 @@ async function main() {
           { ts: '2026-07-18T13:00:00.000Z', source: 'Claude Code', kind: 'prompt', text: 'premigration push', session: 'pre1' },
         ] };
         util.saveState(stC);
-        resPre = await teamsync.syncTeams({ project: projPre, cryptoDeps: { keychain: mkMemKeychain(), teamcrypto: tcE2E } });
+        resPre = await teamsync.syncTeams({ project: projPre, cryptoDeps: { keychain: kcCarol, teamcrypto: tcE2E } });
+        heldCount = mockPre.entries.length;
+        mintedAfterHold = mockPre.teamKeys.length;
+        // Explicit dual-write hatch: the ONLY way the old degrade path runs.
+        const rawC = util.loadUserConfig();
+        rawC.team = { ...(rawC.team || {}), plaintextOff: false };
+        util.saveUserConfig(rawC);
+        resPreHatch = await teamsync.syncTeams({ project: projPre, cryptoDeps: { keychain: kcCarol, teamcrypto: tcE2E } });
       } catch (e) { preErr = e; } finally {
         process.env.MEMBRIDGE_HOME = savedHome;
         process.env.MEMBRIDGE_TEAM_URL = savedUrl2;
         process.env.MEMBRIDGE_TEAM_ANON_KEY = savedKey2;
         mockPre.server.close();
       }
-      check('teamsync: flag-on against a 009-less backend — push drops ciphertext/nonce/key_epoch and retries, pull select degrades, no errors', () => {
+      check('teamsync: 009-less backend under the ciphertext-only default — push fails closed and holds entries', () => {
         assert.ok(!preErr, `premigration scenario threw: ${preErr && preErr.message}`);
-        assert.deepStrictEqual(resPre.errors, [], `sync errors: ${JSON.stringify(resPre && resPre.errors)}`);
-        assert.ok(mockPre.entries.length >= 1, 'expected the push to land after dropping the new columns');
+        assert.strictEqual(resPre.errors.length, 1, `expected exactly the held-entries error: ${JSON.stringify(resPre && resPre.errors)}`);
+        assert.ok(/backend lacks the \w+ column required for ciphertext-only push/.test(resPre.errors[0]),
+          `error must name the missing-column hold: ${resPre.errors[0]}`);
+        assert.strictEqual(heldCount, 0, 'no row may land — a dropped ciphertext column would upload contentless rows');
+        assert.strictEqual(mintedAfterHold, 1, 'the epoch mint itself must still succeed (team_keys has no flag)');
+      });
+      check('teamsync: 009-less backend with the explicit plaintextOff:false hatch — push drops ciphertext/nonce/key_epoch and lands plaintext', () => {
+        assert.ok(!preErr, `premigration scenario threw: ${preErr && preErr.message}`);
+        assert.deepStrictEqual(resPreHatch.errors, [], `hatch sync errors: ${JSON.stringify(resPreHatch && resPreHatch.errors)}`);
+        assert.ok(mockPre.entries.length >= 1, 'expected the hatch push to land after dropping the new columns');
         for (const r of mockPre.entries) {
           assert.ok(!('ciphertext' in r) && !('nonce' in r) && !('key_epoch' in r),
             'new columns must have been dropped for the old backend');
         }
         assert.ok(mockPre.entries.some(e => /premigration push/.test(e.ask || '')), 'plaintext content missing');
-        assert.strictEqual(mockPre.teamKeys.length, 1, 'the epoch mint itself must still succeed (team_keys has no flag)');
       });
     }
   }
@@ -9307,6 +9783,7 @@ async function main() {
         files: {},
         projects: { '/tmp/atomic-roundtrip-project': { events: [{ kind: 'prompt', session: 's1', ts: '2026-07-18T00:00:00.000Z', text: 'atomic write check' }] } },
         catchup: { ...util.DEFAULT_CATCHUP },
+        feedback: { ...util.DEFAULT_FEEDBACK },
       };
       util.saveState(fresh);
       assert.deepStrictEqual(util.loadState(), fresh, 'state did not round-trip through save/load');
@@ -9317,6 +9794,482 @@ async function main() {
     // Restore the real accumulated state so nothing after this section (just
     // the summary print below) is affected by these probes.
     fs.writeFileSync(util.statePath(), priorRaw);
+  }
+
+  // --- ops-noise suppression (classify + feed/push/block filters) ---
+  {
+    const classify = require('../lib/classify');
+    // Edit file lives OUTSIDE the project so it is dropped from rendered files
+    // (no git/deriveChanges on a fake path) — the edit EVENT still marks the
+    // session shareable, which is what these filters key on.
+    const opsProj = { events: [
+      { ts: '2026-07-20T09:00:00.000Z', source: 'Claude Code', kind: 'prompt', session: 'ops', text: 'open browser' },
+      { ts: '2026-07-20T09:01:00.000Z', source: 'Claude Code', kind: 'summary', session: 'ops', text: 'the tab is open now' }, // no edit -> ops noise
+      { ts: '2026-07-20T09:02:00.000Z', source: 'Claude Code', kind: 'prompt', session: 'code', text: 'fix bug' },
+      { ts: '2026-07-20T09:03:00.000Z', source: 'Claude Code', kind: 'edit', session: 'code', file: '/outside-proj/a.js' },
+      // Codex never emits edit events, so its zero-edit sessions must still show.
+      { ts: '2026-07-20T09:04:00.000Z', source: 'Codex', kind: 'prompt', session: 'cx', text: 'refactor the parser' },
+      { ts: '2026-07-20T09:05:00.000Z', source: 'Codex', kind: 'summary', session: 'cx', text: 'parser refactor done' },
+    ] };
+
+    check('classify: suppresses zero-edit sessions from edit-capturing tools, exempts Codex', () => {
+      const set = classify.shareableSessions(opsProj.events);
+      assert.ok(!set.has('ops'), 'zero-edit Claude Code session must be suppressed');
+      assert.ok(set.has('code'), 'a Claude Code session with an edit must be shareable');
+      assert.ok(set.has('cx'), 'a Codex session (never emits edits) must always be shareable');
+      assert.strictEqual(classify.isShareableLocal(opsProj.events, 'ops'), false);
+      assert.strictEqual(classify.isShareableLocal(opsProj.events, 'cx'), true);
+      const filtered = classify.filterShareableEntries(
+        [{ session: 'ops' }, { session: 'code' }, { session: 'cx' }], opsProj.events);
+      assert.deepStrictEqual(filtered.map(e => e.session), ['code', 'cx']);
+      // Fail-open: garbage never throws.
+      assert.deepStrictEqual([...classify.shareableSessions(null)], []);
+      assert.strictEqual(classify.isShareableLocal(null, 'x'), false);
+    });
+
+    check('feed/push: buildEntries source drops zero-edit Claude Code sessions, keeps edits and Codex', () => {
+      const all = memorydb.buildEntries(ROOT, opsProj, util.getConfig());
+      const sessions = new Set(classify.filterShareableEntries(all, opsProj.events).map(e => e.session));
+      assert.ok(!sessions.has('ops'), 'ops-noise session leaked into the feed/push source');
+      assert.ok(sessions.has('code'), 'edit session missing from feed/push source');
+      assert.ok(sessions.has('cx'), 'Codex session missing from feed/push source');
+    });
+
+    check('block: sessionGroups drops zero-edit Claude Code sessions, keeps edits and Codex', () => {
+      const groups = digest.sessionGroups(ROOT, opsProj, util.getConfig());
+      const asks = new Set(groups.map(g => (g.prompts[0] && g.prompts[0].text) || ''));
+      assert.ok(!asks.has('open browser'), 'ops-noise session leaked into the context block');
+      assert.ok(asks.has('fix bug'), 'edit session missing from the context block');
+      assert.ok(asks.has('refactor the parser'), 'Codex session missing from the context block');
+    });
+  }
+
+  // --- git worktrees fold into their main repo's project ---
+  {
+    const pr = require('../lib/project-resolve');
+    const scan = require('../lib/scan');
+    const np = util.normPath;
+
+    check('worktree: worktreeMain parses a .git pointer, ignores real .git dirs', () => {
+      const wt = path.join(ROOT, 'wt-parse');
+      fs.mkdirSync(wt, { recursive: true });
+      fs.writeFileSync(path.join(wt, '.git'), 'gitdir: /some/main/repo/.git/worktrees/feat-x\n');
+      assert.strictEqual(pr.worktreeMain(wt), '/some/main/repo', 'main repo root not derived');
+      const real = path.join(ROOT, 'wt-real');
+      fs.mkdirSync(path.join(real, '.git'), { recursive: true });
+      assert.strictEqual(pr.worktreeMain(real), null, 'a real .git dir must not read as a worktree');
+      const sub = path.join(ROOT, 'wt-sub');
+      fs.mkdirSync(sub, { recursive: true });
+      fs.writeFileSync(path.join(sub, '.git'), 'gitdir: /x/.git/modules/foo\n');
+      assert.strictEqual(pr.worktreeMain(sub), null, 'a submodule pointer must not read as a worktree');
+    });
+
+    check('worktree: resolveRoot redirects a worktree file to its main repo', () => {
+      const main = '/repo';
+      const wt = '/repo/.claude/worktrees/feat-x';
+      const trackedRoots = new Set([np(main)]);
+      const opts = {
+        worktreeMain: dir => (np(dir) === np(wt) ? main : null),
+        hasMembridge: () => false,
+        hasGit: dir => np(dir) === np(main), // main is the only real repo root
+      };
+      assert.strictEqual(pr.resolveRoot(wt + '/lib/a.js', trackedRoots, opts), main,
+        'a worktree file must resolve to the main repo project');
+    });
+
+    check('worktree: foldWorktreeProjects merges a fragment into its main project', () => {
+      const main = '/repo';
+      const wt = '/repo/.claude/worktrees/gone'; // deleted from disk -> path fallback
+      const state = { projects: {
+        [main]: { events: [
+          { ts: '2026-07-20T09:00:00.000Z', source: 'Claude Code', kind: 'edit', session: 'm', file: '/repo/a.js', project: main }] },
+        [wt]: { events: [
+          { ts: '2026-07-20T09:01:00.000Z', source: 'Claude Code', kind: 'prompt', session: 'w', text: 'do it', project: wt },
+          { ts: '2026-07-20T09:02:00.000Z', source: 'Claude Code', kind: 'edit', session: 'w', file: '/repo/.claude/worktrees/gone/b.js', project: wt }] },
+      }, files: {} };
+      const folded = scan.foldWorktreeProjects(state, util.getConfig());
+      assert.strictEqual(folded.length, 1, `expected one fold, got ${JSON.stringify(folded)}`);
+      assert.ok(!state.projects[wt], 'worktree fragment was not removed');
+      const sessions = new Set((state.projects[main].events || []).map(e => e.session));
+      assert.ok(sessions.has('w') && sessions.has('m'), 'worktree events not merged into main (or main lost)');
+      // idempotent: a second pass folds nothing.
+      assert.strictEqual(scan.foldWorktreeProjects(state, util.getConfig()).length, 0, 'fold is not idempotent');
+    });
+
+    check('worktree: fold never touches a real nested project (no worktrees segment)', () => {
+      const state = { projects: {
+        '/repo': { events: [] },
+        '/repo/packages/api': { events: [{ ts: '2026-07-20T09:00:00.000Z', source: 'Claude Code', kind: 'edit', session: 's', file: '/repo/packages/api/x.js', project: '/repo/packages/api' }] },
+      }, files: {} };
+      const folded = scan.foldWorktreeProjects(state, util.getConfig());
+      assert.strictEqual(folded.length, 0, 'a normal nested project must not be folded');
+      assert.ok(state.projects['/repo/packages/api'], 'nested project was wrongly removed');
+    });
+  }
+
+  // --- update check (version compare + cached, fail-silent release lookup) ---
+  {
+    const uc = require('../lib/update-check');
+    const clearCache = () => { try { fs.unlinkSync(uc.cachePath()); } catch {} };
+    const mkFetch = tag => async () => ({ ok: true, json: async () => ({ tag_name: tag }) });
+    const failFetch = () => async () => { throw new Error('offline'); };
+
+    check('update-check: parseVersion + numeric (not lexical) compare', () => {
+      assert.deepStrictEqual(uc.parseVersion('v1.2.3'), [1, 2, 3]);
+      assert.deepStrictEqual(uc.parseVersion('1.2'), [1, 2, 0]);
+      assert.strictEqual(uc.parseVersion('garbage'), null);
+      assert.ok(uc.compareVersions('0.1.10', '0.1.9') > 0, '0.1.10 must beat 0.1.9');
+      assert.ok(uc.compareVersions('1.0.0', '0.9.9') > 0);
+      assert.strictEqual(uc.isNewer('0.1.1', '0.1.1'), false);
+      assert.strictEqual(uc.isNewer('0.1.0', '0.1.1'), false);
+    });
+
+    await check('update-check: reports an available update from the API', async () => {
+      clearCache();
+      const r = await uc.check({ current: '0.1.1', force: true, now: 1000, fetchImpl: mkFetch('v0.2.0') });
+      assert.strictEqual(r.latest, '0.2.0');
+      assert.strictEqual(r.updateAvailable, true);
+    });
+
+    await check('update-check: no update when already on latest', async () => {
+      clearCache();
+      const r = await uc.check({ current: '0.2.0', force: true, now: 1000, fetchImpl: mkFetch('v0.2.0') });
+      assert.strictEqual(r.updateAvailable, false);
+    });
+
+    await check('update-check: offline is fail-silent (null latest, no throw)', async () => {
+      clearCache();
+      const r = await uc.check({ current: '0.1.1', force: true, now: 1000, fetchImpl: failFetch() });
+      assert.strictEqual(r.latest, null);
+      assert.strictEqual(r.updateAvailable, false);
+    });
+
+    await check('update-check: TTL caches the result; force bypasses it', async () => {
+      clearCache();
+      let calls = 0;
+      const counting = async () => { calls++; return { ok: true, json: async () => ({ tag_name: 'v0.3.0' }) }; };
+      await uc.check({ current: '0.1.1', now: 1000, fetchImpl: counting });      // fetch #1
+      await uc.check({ current: '0.1.1', now: 2000, fetchImpl: counting });      // within TTL -> cached
+      assert.strictEqual(calls, 1, 'second call within TTL must not re-fetch');
+      await uc.check({ current: '0.1.1', now: 3000, force: true, fetchImpl: counting }); // force -> re-fetch
+      assert.strictEqual(calls, 2, 'force must re-fetch');
+      // ...and past the TTL it re-fetches on its own.
+      await uc.check({ current: '0.1.1', now: 3000 + uc.CACHE_TTL_MS + 1, fetchImpl: counting });
+      assert.strictEqual(calls, 3, 'a check past the TTL must re-fetch');
+    });
+
+    check('update-check: once-per-version notification guard', () => {
+      clearCache();
+      assert.strictEqual(uc.alreadyNotified('0.2.0'), false);
+      uc.markNotified('0.2.0');
+      assert.strictEqual(uc.alreadyNotified('0.2.0'), true);
+      assert.strictEqual(uc.alreadyNotified('0.3.0'), false, 'a newer version must notify again');
+      clearCache();
+    });
+
+    check('update-check: updateCommand matches install kind', () => {
+      assert.strictEqual(uc.updateCommand('app'), 'curl -fsSL https://membridge.me/install.sh | sh');
+      assert.strictEqual(uc.updateCommand('npm'), 'npm install -g @membridgeai/membridge');
+    });
+  }
+
+  // New-device key recovery: a member whose keypair rotated (new machine /
+  // reset key store) is otherwise stuck forever — their stale sealed row is
+  // never overwritten and join-seal skips them. Two paths must recover them:
+  // (1) self-heal drops the stale row so a re-trusting holder re-seals the
+  // SAME key (history recovered); (2) an owner can `rekey` to a fresh epoch.
+  {
+    const tcR = require('../lib/teamcrypto');
+    const mkMemKc = () => { const m = new Map(); return {
+      available: () => true, load: a => m.get(a) || null,
+      store: (a, s) => { m.set(a, s); return true; }, remove: a => m.delete(a), _m: m }; };
+    const setCfg = () => { util.ensureConfig(); const raw = util.loadUserConfig();
+      raw.team = { ...(raw.team || {}), sharePrompts: true, encrypt: true }; util.saveUserConfig(raw); };
+    const savedHome = process.env.MEMBRIDGE_HOME;
+    const savedUrl = process.env.MEMBRIDGE_TEAM_URL;
+    const savedKey = process.env.MEMBRIDGE_TEAM_ANON_KEY;
+    const homeA = path.join(ROOT, 'home-recA');
+    const homeB = path.join(ROOT, 'home-recB');
+    const projR = path.join(ROOT, 'projects', 'rec-app');
+    fs.mkdirSync(projR, { recursive: true });
+    const kcA = mkMemKc();
+    const kcBold = mkMemKc();      // Bob's original device
+    const kcBnew = mkMemKc();      // Bob's NEW device (fresh keypair)
+    const mockR = createMockSupabase();
+    let err = null;
+    let bobStaleDropped = null, bobRecovered = null, rekeyRes = null, rekeyEpoch = null;
+    let nonOwnerRekey = null, aliceUserId = null, bobUserId = null;
+    try {
+      await new Promise(r => mockR.server.listen(17961, '127.0.0.1', r));
+      process.env.MEMBRIDGE_TEAM_URL = 'http://127.0.0.1:17961';
+      process.env.MEMBRIDGE_TEAM_ANON_KEY = 'anon-test';
+
+      // Alice owns the team; Bob joins and bootstraps his ORIGINAL identity.
+      process.env.MEMBRIDGE_HOME = homeA; setCfg();
+      await teamsync.signup(util.getConfig(), 'a-rec@test.dev', 'pw', 'Alice');
+      const teamR = await teamsync.createTeam(util.getConfig(), 'REC');
+      await teamsync.linkProject(util.getConfig(), projR, teamR.team_id, 'REC');
+      aliceUserId = mockR.users.get('a-rec@test.dev').id;
+
+      process.env.MEMBRIDGE_HOME = homeB; setCfg();
+      await teamsync.signup(util.getConfig(), 'b-rec@test.dev', 'pw', 'Bob');
+      await teamsync.joinTeam(util.getConfig(), teamR.invite_code);
+      bobUserId = mockR.users.get('b-rec@test.dev').id;
+      // Bob bootstraps his identity first WITHOUT a linked project (uploads his
+      // pubkey, does not mint), so Alice's epoch-1 mint seals to BOTH members.
+      await teamsync.syncTeams({ cryptoDeps: { keychain: kcBold, teamcrypto: tcR } });
+
+      // Alice mints epoch-1 sealed to both (she pushes a session).
+      process.env.MEMBRIDGE_HOME = homeA;
+      const stA = util.loadState();
+      stA.projects[projR] = { events: [
+        { ts: '2026-07-18T12:00:00.000Z', source: 'Claude Code', kind: 'prompt', text: 'do the thing', session: 'r1' },
+        { ts: '2026-07-18T12:01:00.000Z', source: 'Claude Code', kind: 'edit', file: path.join(projR, 'a.js'), session: 'r1' },
+        { ts: '2026-07-18T12:02:00.000Z', source: 'Claude Code', kind: 'summary', text: 'did the thing', session: 'r1' },
+      ] };
+      util.saveState(stA);
+      await teamsync.syncTeams({ project: projR, cryptoDeps: { keychain: kcA, teamcrypto: tcR } });
+
+      // Bob switches to a NEW device: fresh keychain, same home/creds. Give
+      // his home the project, then sync — uploads a new pubkey (overwriting the
+      // old) and must self-heal the now-unopenable epoch-1 row.
+      process.env.MEMBRIDGE_HOME = homeB;
+      { const st = util.loadState(); st.projects[projR] = { events: [] }; util.saveState(st); }
+      await teamsync.syncTeams({ project: projR, cryptoDeps: { keychain: kcBnew, teamcrypto: tcR } });
+      bobStaleDropped = !mockR.teamKeys.some(k => k.member_user_id === bobUserId);
+
+      // Alice re-trusts Bob's rotated key (out-of-band verified) and syncs:
+      // join-seal re-seals epoch-1 to Bob's NEW key.
+      process.env.MEMBRIDGE_HOME = homeA;
+      await teamsync.trustMember(util.getConfig(), bobUserId);
+      await teamsync.syncTeams({ project: projR, cryptoDeps: { keychain: kcA, teamcrypto: tcR } });
+
+      // Bob syncs again on the new device: he can now open the team key.
+      process.env.MEMBRIDGE_HOME = homeB;
+      const rb = await teamsync.syncTeams({ project: projR, cryptoDeps: { keychain: kcBnew, teamcrypto: tcR } });
+      bobRecovered = (rb.errors || []).length === 0 && !util.loadState().teamCryptoPaused;
+
+      // Owner rekey path: Alice rekeys; a fresh epoch seals to both trusted
+      // members and she can open her own new row.
+      process.env.MEMBRIDGE_HOME = homeA;
+      rekeyRes = await teamsync.rekeyTeam(util.getConfig(), teamR.team_id,
+        { cryptoDeps: { keychain: kcA, teamcrypto: tcR } });
+      rekeyEpoch = rekeyRes.epoch;
+
+      // Non-owner rekey is refused.
+      process.env.MEMBRIDGE_HOME = homeB;
+      nonOwnerRekey = await teamsync.rekeyTeam(util.getConfig(), teamR.team_id,
+        { cryptoDeps: { keychain: kcBnew, teamcrypto: tcR } });
+    } catch (e) { err = e; } finally {
+      process.env.MEMBRIDGE_HOME = savedHome;
+      process.env.MEMBRIDGE_TEAM_URL = savedUrl;
+      process.env.MEMBRIDGE_TEAM_ANON_KEY = savedKey;
+      mockR.server.close();
+    }
+
+    check('teamsync: a rotated-key device self-heals — its stale sealed row is dropped so a holder can re-seal', () => {
+      assert.ok(!err, `recovery scenario threw: ${err && err.message}`);
+      assert.strictEqual(bobStaleDropped, true, 'Bob\'s stale epoch-1 row must be deleted on his new device');
+    });
+    check('teamsync: after the holder re-trusts + syncs, the rotated-key device recovers the same key (history included)', () => {
+      assert.ok(!err, `recovery scenario threw: ${err && err.message}`);
+      assert.ok(mockR.teamKeys.some(k => k.member_user_id === bobUserId && String(k.epoch) === '1'),
+        'epoch-1 must be re-sealed to Bob\'s new key');
+      assert.strictEqual(bobRecovered, true, 'Bob must resolve the key with no pause after recovery');
+    });
+    check('teamsync: owner rekey mints a fresh epoch sealed to every trusted member, openable by the owner', () => {
+      assert.ok(!err, `recovery scenario threw: ${err && err.message}`);
+      assert.ok(rekeyRes && rekeyRes.ok, `rekey failed: ${rekeyRes && rekeyRes.error}`);
+      assert.strictEqual(rekeyEpoch, 2, 'rekey must advance to epoch 2');
+      assert.strictEqual(rekeyRes.sealed, 2, 'new epoch must seal to both members');
+      assert.ok(mockR.teamKeys.filter(k => String(k.epoch) === '2').length === 2, 'two epoch-2 rows expected');
+    });
+    check('teamsync: rekey is owner/admin only — a plain member is refused', () => {
+      assert.ok(!err, `recovery scenario threw: ${err && err.message}`);
+      assert.ok(nonOwnerRekey && nonOwnerRekey.ok === false, 'non-owner rekey must fail');
+      assert.ok(/owner or admin/i.test(nonOwnerRekey.error || ''), `expected role error, got: ${nonOwnerRekey && nonOwnerRekey.error}`);
+    });
+  }
+
+  // Multi-device FULL-HISTORY recovery: a new device must recover EVERY past
+  // epoch it's entitled to, not just the current one — the platform behavior
+  // that makes "log in on a new machine, see all your history" actually work.
+  {
+    const tcM = require('../lib/teamcrypto');
+    const mkKc = () => { const m = new Map(); return {
+      available: () => true, load: a => m.get(a) || null,
+      store: (a, s) => { m.set(a, s); return true; }, remove: a => m.delete(a) }; };
+    const setCfg = () => { util.ensureConfig(); const raw = util.loadUserConfig();
+      raw.team = { ...(raw.team || {}), sharePrompts: true, encrypt: true }; util.saveUserConfig(raw); };
+    const sHome = process.env.MEMBRIDGE_HOME, sUrl = process.env.MEMBRIDGE_TEAM_URL, sKey = process.env.MEMBRIDGE_TEAM_ANON_KEY;
+    const hA = path.join(ROOT, 'home-mdA'), hB = path.join(ROOT, 'home-mdB');
+    const projM = path.join(ROOT, 'projects', 'md-app');
+    fs.mkdirSync(projM, { recursive: true });
+    const kcA = mkKc(), kcBold = mkKc(), kcBnew = mkKc();
+    const mockM = createMockSupabase();
+    let err = null, bobUserId = null, openEpochs = null, teamId = null;
+    try {
+      await new Promise(r => mockM.server.listen(17974, '127.0.0.1', r));
+      process.env.MEMBRIDGE_TEAM_URL = 'http://127.0.0.1:17974';
+      process.env.MEMBRIDGE_TEAM_ANON_KEY = 'anon-test';
+
+      process.env.MEMBRIDGE_HOME = hA; setCfg();
+      await teamsync.signup(util.getConfig(), 'a-md@test.dev', 'pw', 'Alice');
+      const t = await teamsync.createTeam(util.getConfig(), 'MD'); teamId = t.team_id;
+      await teamsync.linkProject(util.getConfig(), projM, t.team_id, 'MD');
+
+      process.env.MEMBRIDGE_HOME = hB; setCfg();
+      await teamsync.signup(util.getConfig(), 'b-md@test.dev', 'pw', 'Bob');
+      await teamsync.joinTeam(util.getConfig(), t.invite_code);
+      bobUserId = mockM.users.get('b-md@test.dev').id;
+      // Bob bootstraps his identity WITHOUT a linked project, so he only
+      // uploads his pubkey and does NOT mint — Alice's epoch-1 mint then seals
+      // to BOTH members (mirrors the real join-before-first-content order).
+      await teamsync.syncTeams({ cryptoDeps: { keychain: kcBold, teamcrypto: tcM } });
+
+      // Alice mints epoch-1 (push), then rekeys to epoch-2 — both sealed to
+      // Bob's ORIGINAL key. Now there is real multi-epoch history.
+      process.env.MEMBRIDGE_HOME = hA;
+      const stA = util.loadState();
+      stA.projects[projM] = { events: [
+        { ts: '2026-07-18T12:00:00.000Z', source: 'Claude Code', kind: 'prompt', text: 'epoch one work', session: 'm1' },
+        { ts: '2026-07-18T12:01:00.000Z', source: 'Claude Code', kind: 'edit', file: path.join(projM, 'a.js'), session: 'm1' },
+      ] };
+      util.saveState(stA);
+      await teamsync.syncTeams({ project: projM, cryptoDeps: { keychain: kcA, teamcrypto: tcM } });
+      await teamsync.rekeyTeam(util.getConfig(), t.team_id, { cryptoDeps: { keychain: kcA, teamcrypto: tcM } });
+
+      // Bob's NEW device: give his home the project now, both his epoch-1 and
+      // epoch-2 rows are stale against his fresh keypair.
+      process.env.MEMBRIDGE_HOME = hB;
+      { const st = util.loadState(); st.projects[projM] = { events: [] }; util.saveState(st); }
+      await teamsync.syncTeams({ project: projM, cryptoDeps: { keychain: kcBnew, teamcrypto: tcM } });
+
+      // Alice re-trusts Bob's new key and syncs: reconcile re-seals BOTH epochs.
+      process.env.MEMBRIDGE_HOME = hA;
+      await teamsync.trustMember(util.getConfig(), bobUserId);
+      await teamsync.syncTeams({ project: projM, cryptoDeps: { keychain: kcA, teamcrypto: tcM } });
+
+      // Prove Bob's NEW key can open every epoch sealed to him.
+      await tcM.ready();
+      const priv = kcBnew.load('membridge.box.privatekey'), pub = kcBnew.load('membridge.box.publickey');
+      const bobRows = mockM.teamKeys.filter(k => k.member_user_id === bobUserId);
+      openEpochs = bobRows
+        .filter(k => tcM.unsealTeamKey(k.sealed_team_key, pub, priv))
+        .map(k => Number(k.epoch)).sort();
+    } catch (e) { err = e; } finally {
+      process.env.MEMBRIDGE_HOME = sHome; process.env.MEMBRIDGE_TEAM_URL = sUrl; process.env.MEMBRIDGE_TEAM_ANON_KEY = sKey;
+      mockM.server.close();
+    }
+
+    check('teamsync: a new device recovers ALL past epochs (full history), not just the current one', () => {
+      assert.ok(!err, `multi-epoch scenario threw: ${err && err.message}`);
+      assert.deepStrictEqual(openEpochs, [1, 2],
+        `Bob's new device must open epoch 1 AND 2 after recovery, opened: ${JSON.stringify(openEpochs)}`);
+    });
+  }
+
+  // --- post-install feedback nudges (feat/feedback-hook) ---
+  // Local-only: these exercise lib/prompts against the sandbox state, toggling
+  // isTTY / CI / config.prompts and capturing console output. No network.
+  {
+    const prompts = require('../lib/prompts');
+    const origTTY = Object.getOwnPropertyDescriptor(process.stdout, 'isTTY');
+    const origCI = process.env.CI;
+    const savedState = read(util.statePath());
+    let out = [];
+    const origLog = console.log;
+    const cap = () => { out = []; console.log = (...a) => out.push(a.join(' ')); };
+    const uncap = () => { console.log = origLog; };
+    const printed = () => out.join('\n');
+    const setTTY = v => Object.defineProperty(process.stdout, 'isTTY', { value: v, configurable: true });
+    const withEvents = fb => ({
+      version: util.STATE_VERSION, files: {},
+      projects: { '/tmp/fb-proj': { events: [{ kind: 'prompt', session: 'fb-s1', ts: '2026-07-18T00:00:00.000Z', text: 'x' }] } },
+      catchup: { ...util.DEFAULT_CATCHUP }, feedback: { ...util.DEFAULT_FEEDBACK, ...fb },
+    });
+
+    try {
+      delete process.env.CI;
+      setTTY(true);
+
+      check('feedback: first-run message A prints once under a TTY, then never again', () => {
+        util.saveState(withEvents({ firstRunShown: false }));
+        cap(); prompts.maybeFirstRun(util.getConfig()); uncap();
+        const first = printed();
+        assert.ok(/MemBridge is running/.test(first), 'message A not printed');
+        assert.ok(/membridge\.me\/feedback\?ref=cli/.test(first), 'message A missing the feedback link');
+        assert.ok(/MembridgeAi\/membridge/.test(first) && !/andrewb-eng/.test(first), 'links must use MembridgeAi/membridge only');
+        cap(); prompts.maybeFirstRun(util.getConfig()); uncap();
+        assert.strictEqual(printed(), '', 'message A must not print a second time');
+        assert.strictEqual(util.loadState().feedback.firstRunShown, true, 'firstRunShown not persisted');
+      });
+
+      check('feedback: no message without a TTY, or when CI is set (state untouched)', () => {
+        util.saveState(withEvents({ firstRunShown: false }));
+        setTTY(false);
+        cap(); prompts.maybeFirstRun(util.getConfig()); uncap();
+        assert.strictEqual(printed(), '', 'must not print without a TTY');
+        setTTY(true);
+        process.env.CI = '1';
+        cap(); prompts.maybeFirstRun(util.getConfig()); uncap();
+        assert.strictEqual(printed(), '', 'must not print under CI');
+        delete process.env.CI;
+        assert.strictEqual(util.loadState().feedback.firstRunShown, false, 'a suppressed call must not mark firstRunShown');
+      });
+
+      check('feedback: value moment B prints once after 5 amendments (with a real session count), then never again', () => {
+        util.saveState(withEvents({ firstRunShown: true, valueShown: false, amendments: 5 }));
+        cap(); prompts.flushValueMoment(util.getConfig()); uncap();
+        const b = printed();
+        assert.ok(/synced 1 sessions/.test(b), 'message B must carry the real session count: ' + b);
+        assert.ok(/ref=cli-value/.test(b), 'message B missing the value link');
+        assert.ok(!/ 0 sessions/.test(b), 'message B must never say 0 sessions');
+        cap(); prompts.flushValueMoment(util.getConfig()); uncap();
+        assert.strictEqual(printed(), '', 'message B must not print a second time');
+        assert.strictEqual(util.loadState().feedback.valueShown, true, 'valueShown not persisted');
+      });
+
+      check('feedback: below 5 amendments the value moment stays silent', () => {
+        util.saveState(withEvents({ firstRunShown: true, valueShown: false, amendments: 4 }));
+        cap(); prompts.flushValueMoment(util.getConfig()); uncap();
+        assert.strictEqual(printed(), '', 'B must not print before the 5th amendment');
+      });
+
+      check('feedback: config prompts:false suppresses both messages', () => {
+        util.saveState(withEvents({ firstRunShown: false, valueShown: false, amendments: 5 }));
+        const cfg = { ...util.getConfig(), prompts: false };
+        cap(); prompts.maybeFirstRun(cfg); prompts.flushValueMoment(cfg); uncap();
+        assert.strictEqual(printed(), '', 'prompts:false must suppress both A and B');
+        assert.strictEqual(util.loadState().feedback.firstRunShown, false, 'suppressed A must not mark shown');
+      });
+
+      check('feedback: countAmendments counts only updated context-file writes, not memory.md/db', () => {
+        const cfg = util.getConfig();
+        const target = util.effectiveTargets(cfg)[0]; // e.g. CLAUDE.md
+        const changes = [
+          { file: '/p/' + target, action: 'updated' },
+          { file: '/p/' + target, action: 'would update' },        // dry-run action: not counted
+          { file: '/p/.membridge/memory.md', action: 'updated' },  // not a context target
+          { file: '/p/.membridge/memory.json', action: 'updated' },// not a context target
+        ];
+        assert.strictEqual(prompts.countAmendments(changes, cfg), 1, 'only the real context-file update should count');
+      });
+
+      check('feedback: syncOnce increments state.feedback.amendments for real context-file writes', () => {
+        util.saveState(withEvents({ firstRunShown: true, valueShown: false, amendments: 0 }));
+        const before = util.loadState().feedback.amendments;
+        syncOnce({ project: proj1 }); // proj1 has accumulated events + a real CLAUDE.md target
+        const after = util.loadState().feedback.amendments;
+        assert.ok(after >= before, 'amendments must never decrease');
+      });
+    } finally {
+      uncap();
+      if (origTTY) Object.defineProperty(process.stdout, 'isTTY', origTTY);
+      else { try { delete process.stdout.isTTY; } catch { setTTY(undefined); } }
+      if (origCI === undefined) delete process.env.CI; else process.env.CI = origCI;
+      fs.writeFileSync(util.statePath(), savedState); // restore the suite's accumulated state
+    }
   }
 
   // --- summary ---

@@ -4,7 +4,7 @@
 // the CLI daemon — the app shell is just a face on it.
 const fs = require('fs');
 const path = require('path');
-const { app, Tray, Menu, BrowserWindow, nativeImage, dialog } = require('electron');
+const { app, Tray, Menu, BrowserWindow, nativeImage, dialog, shell } = require('electron');
 
 // lib/ is copied into app/lib by scripts/prepare-app.js (packaged builds);
 // fall back to ../lib when running straight from the repo.
@@ -19,6 +19,7 @@ const util = lib('util');
 const { syncOnce } = lib('scan');
 const { startServer } = lib('server');
 const teamsync = lib('teamsync');
+const hooks = lib('hooks');
 
 const SMOKE = process.argv.includes('--smoke');
 let tray = null;
@@ -101,11 +102,91 @@ function openDashboard() {
     height: 720,
     title: 'MemBridge',
     autoHideMenuBar: true,
+    icon: nativeImage.createFromPath(path.join(__dirname, 'assets', 'icon.png')),
   });
   win.loadURL(dashboardUrl());
+  // Anything the dashboard opens as a popup (the GitHub sign-in round trip)
+  // goes to the default browser — GitHub is already signed in there, and
+  // nothing external ever renders inside the app window.
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    shell.openExternal(url);
+    return { action: 'deny' };
+  });
   win.on('closed', () => {
     win = null;
   });
+}
+
+// Check for a newer release. Best-effort and fail-silent. MemBridge has no
+// in-app auto-updater (that would need an Apple Developer signature), so we
+// point the user at the one-line installer instead of updating for them.
+//
+// Two modes:
+//  - automatic (on launch): silent unless a newer version exists, and only
+//    nags once per version.
+//  - manual ("Check for updates…" menu item): always reports a result, forces
+//    a fresh network check, and ignores the once-per-version guard.
+async function checkForUpdate({ manual = false } = {}) {
+  const updateCheck = lib('update-check');
+  try {
+    const r = await updateCheck.check({ current: app.getVersion(), force: manual });
+    if (!r.updateAvailable) {
+      if (manual) {
+        await dialog.showMessageBox({
+          type: 'info',
+          title: 'MemBridge',
+          message: r.latest
+            ? `You're up to date — v${r.current} is the latest version.`
+            : `Couldn't reach the update server. You're on v${r.current}.`,
+          buttons: ['OK'],
+        });
+      }
+      return;
+    }
+    if (!manual && updateCheck.alreadyNotified(r.latest)) return;
+    updateCheck.markNotified(r.latest);
+    const command = updateCheck.updateCommand('app');
+    const { response } = await dialog.showMessageBox({
+      type: 'info',
+      title: 'Update available',
+      message: `MemBridge v${r.latest} is available (you're on v${r.current}).`,
+      detail: 'Install now? MemBridge will quit, update, and reopen automatically — this takes a few seconds.',
+      buttons: ['Install and restart', 'Later'],
+      defaultId: 0,
+      cancelId: 1,
+    });
+    if (response === 0) {
+      // Install in place instead of opening a web page. Run the pinned installer
+      // DETACHED (its own session) so it survives this app quitting — install.sh
+      // quits the running MemBridge to replace its bundle, then reopens the new
+      // version itself (its step 8 `open`). stdio is ignored; it finishes on its own.
+      const { spawn } = require('child_process');
+      try {
+        spawn('/bin/sh', ['-c', command], { detached: true, stdio: 'ignore' }).unref();
+        await dialog.showMessageBox({
+          type: 'info',
+          title: 'Updating MemBridge',
+          message: `Installing v${r.latest}…`,
+          detail: 'MemBridge will quit while it updates, then reopen automatically.',
+          buttons: ['OK'],
+        });
+      } catch {
+        shell.openExternal(updateCheck.RELEASES_PAGE); // fallback if the installer can't launch
+      }
+    }
+  } catch {
+    // an update check must never take the app down
+    if (manual) {
+      try {
+        await dialog.showMessageBox({
+          type: 'warning',
+          title: 'MemBridge',
+          message: 'Could not check for updates right now.',
+          buttons: ['OK'],
+        });
+      } catch {}
+    }
+  }
 }
 
 function updateMenu() {
@@ -135,6 +216,7 @@ function updateMenu() {
       },
     },
     { type: 'separator' },
+    { label: `Check for updates… (v${app.getVersion()})`, click: () => checkForUpdate({ manual: true }) },
     {
       label: 'Start at login',
       type: 'checkbox',
@@ -147,11 +229,29 @@ function updateMenu() {
   tray.setContextMenu(menu);
 }
 
-const gotLock = app.requestSingleInstanceLock();
-if (!gotLock) {
+// Headless launch-at-login toggle: `MemBridge --set-login=on|off` flips the
+// login item and exits, without opening the tray/UI. Lets an installer (or a
+// script) manage autostart, and stays in sync with the tray "Start at login"
+// checkbox since both use Electron's login-item settings. Handled before the
+// single-instance lock so it works even while the app is already running.
+const loginArg = process.argv.find(a => a.startsWith('--set-login='));
+if (loginArg) {
+  app.whenReady().then(() => {
+    app.setLoginItemSettings({ openAtLogin: loginArg.split('=')[1] !== 'off' });
+    app.exit(0);
+  });
+} else if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
+  // Re-launching the app while it's already running (double-clicking the icon
+  // again) opens the dashboard instead of doing nothing — the single-instance
+  // lock otherwise just quietly quits the second copy.
+  app.on('second-instance', openDashboard);
   app.whenReady().then(async () => {
+    // Windows groups taskbar buttons and picks the window/jump-list icon by
+    // AppUserModelID; without this it can fall back to the generic Electron
+    // icon. Must match build.appId and be set before any window is created.
+    if (process.platform === 'win32') app.setAppUserModelId('com.membridge.app');
     util.ensureConfig();
     takeOverDaemon();
     const config = util.getConfig();
@@ -161,6 +261,12 @@ if (!gotLock) {
     const icon = nativeImage.createFromPath(path.join(__dirname, 'assets', iconName));
     tray = new Tray(icon);
     tray.setToolTip('MemBridge — shared memory across your AI coding tools');
+    // Left-click (or a double-click) the tray icon opens the dashboard — the
+    // primary way to open the app on Windows/Linux, where the context menu is
+    // right-click only. On macOS a click opens the menu by convention, so the
+    // menu already carries "Open dashboard" there.
+    tray.on('click', openDashboard);
+    tray.on('double-click', openDashboard);
     updateMenu();
 
     // First-run consent for session summaries
@@ -179,8 +285,15 @@ if (!gotLock) {
 
     // smoke mode verifies tray + server boot only — it must never sync/write
     if (!SMOKE) {
+      // Auto-register the Claude Code Stop hook when the app launches, so users
+      // who only ever download and open MemBridge.app get it without a manual
+      // `setup-hooks` step. Silent and fail-open. Kept inside !SMOKE so the
+      // CI/build boot-check never writes to a real ~/.claude/settings.json.
+      hooks.ensureInstalled();
       tick();
       setInterval(tick, config.intervalSec * 1000);
+      // Fire-and-forget: notify once per version if a newer release exists.
+      checkForUpdate();
     }
 
     if (SMOKE) {

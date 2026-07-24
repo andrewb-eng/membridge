@@ -1,6 +1,6 @@
 {
-  "name": "membridge",
-  "version": "0.1.1",
+  "name": "@membridgeai/membridge",
+  "version": "0.1.6",
   "description": "Shared memory across your AI coding tools. A tiny background daemon that watches Claude Code, Codex and any other agent's session logs, distills a brief per-project memory, and syncs it into the context files every tool reads (CLAUDE.md, AGENTS.md, ...).",
   "keywords": [
     "ai",
@@ -12,11 +12,11 @@
     "sync",
     "developer-tools"
   ],
-  "license": "MIT",
+  "license": "FSL-1.1-ALv2",
   "author": "Andrew Brown & Marco Melika",
-  "homepage": "https://github.com/mmelika/membridge#readme",
+  "homepage": "https://github.com/MembridgeAi/membridge#readme",
   "bugs": {
-    "url": "https://github.com/mmelika/membridge/issues"
+    "url": "https://github.com/MembridgeAi/membridge/issues"
   },
   "bin": {
     "membridge": "bin/membridge.js"
@@ -60,7 +60,8 @@
     "win": {
       "target": [
         "zip"
-      ]
+      ],
+      "icon": "app/assets/icon.png"
     }
   },
   "engines": {
@@ -68,7 +69,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/mmelika/membridge.git"
+    "url": "git+https://github.com/MembridgeAi/membridge.git"
   },
   "devDependencies": {
     "electron": "^43.1.0",

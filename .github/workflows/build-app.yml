@@ -1,12 +1,12 @@
-# Builds the MemBridge tray app for macOS (menu bar) on Apple's runners.
-# Runs on every push to master (fresh installer artifact per push), on manual
-# dispatch, and on every published release; release builds are attached to the
-# release as downloadable artifacts.
+# Builds the MemBridge tray app for macOS (menu bar) and Windows (system tray)
+# on their native runners. Runs on every push to master (fresh artifact per
+# push), on manual dispatch, and on every published release; release builds are
+# attached to the release as downloadable zips.
 name: Build app
 
 on:
   push:
-    branches: [master, brown]
+    branches: [master]
   workflow_dispatch:
   release:
     types: [published]
@@ -23,6 +23,9 @@ jobs:
         with:
           node-version: 22
       - run: npm install
+      # The MCP tests need these opt-in deps (deliberately kept out of
+      # package.json so a plain install stays light). Mirrors ci.yml.
+      - run: npm install --no-save --no-audit --no-fund @modelcontextprotocol/sdk@^1 zod@^4
       - run: node test/run-tests.js
       - run: npm run dist:mac
         env:
@@ -30,12 +33,34 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: membridge-mac
-          path: |
-            dist/*.dmg
-            dist/*.zip
+          path: dist/*.zip
       - name: Attach to release
         if: github.event_name == 'release'
-        run: gh release upload "$TAG" dist/*.dmg dist/*-mac.zip --clobber
+        run: gh release upload "$TAG" dist/*.zip --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.release.tag_name }}
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install
+      - run: npm install --no-save --no-audit --no-fund @modelcontextprotocol/sdk@^1 zod@^4
+      - run: node test/run-tests.js
+      - run: npm run dist:win
+      - uses: actions/upload-artifact@v4
+        with:
+          name: membridge-win
+          path: dist/*.zip
+      - name: Attach to release
+        if: github.event_name == 'release'
+        # Git Bash on the Windows runner, so the glob + $TAG match the mac job.
+        shell: bash
+        run: gh release upload "$TAG" dist/*.zip --clobber
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.event.release.tag_name }}

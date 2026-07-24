@@ -122,7 +122,7 @@ run. Steps, in order:
 1. **Preflight:** confirm macOS + arm64 (`uname`); if not arm64, print the npm CLI
    fallback and exit cleanly.
 2. **Download** the pinned release asset with `curl -fsSL` to a temp dir:
-   `https://github.com/mmelika/membridge/releases/download/v<VER>/MemBridge-<VER>-arm64.zip`.
+   `https://github.com/MembridgeAi/membridge/releases/download/v<VER>/MemBridge-<VER>-arm64.zip`.
    `curl` does not set `com.apple.quarantine`, which is the whole point.
 3. **Verify** the downloaded zip's SHA-256 against the pinned hash baked into the script;
    abort loudly on mismatch (tamper-evidence for `curl | sh`).

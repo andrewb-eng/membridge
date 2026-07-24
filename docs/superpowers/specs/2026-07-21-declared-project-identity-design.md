@@ -16,7 +16,7 @@ Git-remote-as-identity breaks in three predictable ways, all fatal for an instan
 
 | # | Failure | Real example |
 |---|---------|--------------|
-| 1 | **Forks** — a fork's remote differs, so it mints a *second* project row and teammates silently stop seeing each other. | `andrewb-eng/membridge` → row `84236c88`, split from `mmelika/membridge` → row `ab5f018a`. This actually happened. |
+| 1 | **Forks** — a fork's remote differs, so it mints a *second* project row and teammates silently stop seeing each other. | `andrewb-eng/membridge` → row `84236c88`, split from `MembridgeAi/membridge` → row `ab5f018a`. This actually happened. |
 | 2 | **No remote** — a local-only folder has no key; every machine is an island. | Any `git init` scratch project. |
 | 3 | **Monorepo** — one remote, many logical projects; they collide onto one key. | `repo/packages/api` vs `repo/packages/web`. |
 
